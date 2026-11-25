@@ -916,6 +916,24 @@ fn shim_purecall() callconv(.{ .x86_64_win = .{} }) void {
     std.log.warn("[CRT] _purecall() called from 0x{x}!", .{@returnAddress()});
 }
 
+fn shim_InitializeSListHead(list_head: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
+    const addr = @intFromPtr(list_head);
+    if (addr < 0x10000) return;
+    const bytes: [*]u8 = @ptrFromInt(addr);
+    @memset(bytes[0..16], 0);
+}
+
+fn shim_CreateMutexA(
+    security_attrs: ?*anyopaque,
+    initial_owner: i32,
+    name: ?[*:0]const u8,
+) callconv(.{ .x86_64_win = .{} }) usize {
+    _ = security_attrs;
+    _ = initial_owner;
+    _ = name;
+    return allocDummyHandle();
+}
+
 pub fn resolve(sym_name: []const u8) ?usize {
     const map = .{
         .{ "_initterm", @intFromPtr(&shim_initterm) },
@@ -1037,6 +1055,8 @@ pub fn resolve(sym_name: []const u8) ?usize {
         .{ "SetThreadGroupAffinity", @intFromPtr(&shim_SetThreadGroupAffinity) },
         .{ "GetLocalTime", @intFromPtr(&shim_GetLocalTime) },
         .{ "_purecall", @intFromPtr(&shim_purecall) },
+        .{ "InitializeSListHead", @intFromPtr(&shim_InitializeSListHead) },
+        .{ "CreateMutexA", @intFromPtr(&shim_CreateMutexA) },
     };
 
     inline for (map) |entry| {

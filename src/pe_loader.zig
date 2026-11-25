@@ -79,10 +79,18 @@ const StubInfo = struct {
     name: []const u8,
 };
 
+fn logUnimplementedCall(info: *const StubInfo, caller_ret: usize) callconv(.c) usize {
+    if (std.mem.startsWith(u8, info.name, "__stdio_common_")) return 0;
+    std.log.warn("[CALL] {s}!{s} (from 0x{x})", .{ info.dll, info.name, caller_ret });
+    return 0;
+}
+
 const TrampolineArena = struct {
     base: [*]u8,
     capacity: usize,
     offset: usize = 0,
+
+    const slot_size = 128;
 
     fn init(capacity: usize) !TrampolineArena {
         const ptr = try allocExecutableImage(0, capacity);
@@ -90,68 +98,85 @@ const TrampolineArena = struct {
     }
 
     fn emit(self: *TrampolineArena, allocator: std.mem.Allocator, dll: []const u8, name: []const u8) !usize {
-        if (self.offset + 64 > self.capacity) return error.OutOfMemory;
+        if (self.offset + slot_size > self.capacity) return error.OutOfMemory;
 
         const info = try allocator.create(StubInfo);
         info.* = .{ .dll = dll, .name = name };
 
         const slot = self.base + self.offset;
         const addr = @intFromPtr(slot);
-        self.offset += 64;
+        self.offset += slot_size;
 
         const info_addr: u64 = @intFromPtr(info);
         const logger_addr: u64 = @intFromPtr(&logUnimplementedCall);
 
-        @memset(slot[0..64], 0x90);
+        @memset(slot[0..slot_size], 0x90);
 
         if (builtin.os.tag == .windows) {
-            std.mem.writeInt(u32, slot[0..4], 0x28EC8348, .little);
-            std.mem.writeInt(u16, slot[4..6], 0xB948, .little);
+            std.mem.writeInt(u32, slot[0..4], 0x28EC8348, .little); // sub rsp, 0x28
+            std.mem.writeInt(u16, slot[4..6], 0xB948, .little); // movabs rcx, info_addr
             std.mem.writeInt(u64, slot[6..14], info_addr, .little);
-            std.mem.writeInt(u16, slot[14..16], 0xB848, .little);
+            std.mem.writeInt(u16, slot[14..16], 0xB848, .little); // movabs rax, logger_addr
             std.mem.writeInt(u64, slot[16..24], logger_addr, .little);
-            std.mem.writeInt(u16, slot[24..26], 0xD0FF, .little);
-            std.mem.writeInt(u32, slot[26..30], 0x28C48348, .little);
-            std.mem.writeInt(u8, slot[30..31], 0xC3, .little);
+            std.mem.writeInt(u16, slot[24..26], 0xD0FF, .little); // call rax
+            std.mem.writeInt(u32, slot[26..30], 0x28C48348, .little); // add rsp, 0x28
+            std.mem.writeInt(u8, slot[30..31], 0xC3, .little); // ret
         } else {
-            // Save Win64 non-volatile & volatile regs clobbered by SysV C calls:
-            // push rdi (57), push rsi (56), push rcx (51), push rdx (52)
-            std.mem.writeInt(u32, slot[0..4], 0x52515657, .little);
-            // push r8 (41 50), push r9 (41 51)
-            std.mem.writeInt(u32, slot[4..8], 0x51415041, .little);
-            // push r10 (41 52), push r11 (41 53)
-            std.mem.writeInt(u32, slot[8..12], 0x53415241, .little);
-            // sub rsp, 8 (align stack to 16 bytes for SysV call)
-            std.mem.writeInt(u32, slot[12..16], 0x08EC8348, .little);
-            // movabs rdi, info_addr
-            std.mem.writeInt(u16, slot[16..18], 0xBF48, .little);
-            std.mem.writeInt(u64, slot[18..26], info_addr, .little);
-            // movabs rax, logger_addr
-            std.mem.writeInt(u16, slot[26..28], 0xB848, .little);
-            std.mem.writeInt(u64, slot[28..36], logger_addr, .little);
-            // call rax
-            std.mem.writeInt(u16, slot[36..38], 0xD0FF, .little);
-            // add rsp, 8
-            std.mem.writeInt(u32, slot[38..42], 0x08C48348, .little);
-            // pop r11 (41 5B), pop r10 (41 5A)
-            std.mem.writeInt(u32, slot[42..46], 0x5A415B41, .little);
-            // pop r9 (41 59), pop r8 (41 58)
-            std.mem.writeInt(u32, slot[46..50], 0x58415941, .little);
-            // pop rdx (5A), pop rcx (59), pop rsi (5E), pop rdi (5F)
-            std.mem.writeInt(u32, slot[50..54], 0x5F5E595A, .little);
-            // ret
-            std.mem.writeInt(u8, slot[54..55], 0xC3, .little);
+            var p: usize = 0;
+            const emitBytes = struct {
+                fn put(buf: [*]u8, idx: *usize, bytes: []const u8) void {
+                    @memcpy(buf[idx.* .. idx.* + bytes.len], bytes);
+                    idx.* += bytes.len;
+                }
+            }.put;
+
+            // Save Win64 caller-saved GPRs clobbered by SysV (8 * 8 = 64 bytes)
+            emitBytes(slot, &p, &.{ 0x57, 0x56, 0x51, 0x52 }); // push rdi, rsi, rcx, rdx
+            emitBytes(slot, &p, &.{ 0x41, 0x50, 0x41, 0x51 }); // push r8, r9
+            emitBytes(slot, &p, &.{ 0x41, 0x52, 0x41, 0x53 }); // push r10, r11
+
+            // Grab original return address from [rsp + 64] into r11 (already saved above)
+            // mov r11, [rsp + 0x40] -> 4c 8b 5c 24 40
+            emitBytes(slot, &p, &.{ 0x4C, 0x8B, 0x5C, 0x24, 0x40 });
+
+            // Reserve 0x68 bytes: 0x60 for XMM0..XMM5 + 0x08 to align RSP to 16 bytes for `call`
+            emitBytes(slot, &p, &.{ 0x48, 0x83, 0xEC, 0x68 }); // sub rsp, 0x68
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x44, 0x24, 0x00 }); // movups [rsp+0x00], xmm0
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x4C, 0x24, 0x10 }); // movups [rsp+0x10], xmm1
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x54, 0x24, 0x20 }); // movups [rsp+0x20], xmm2
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x5C, 0x24, 0x30 }); // movups [rsp+0x30], xmm3
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x64, 0x24, 0x40 }); // movups [rsp+0x40], xmm4
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x6C, 0x24, 0x50 }); // movups [rsp+0x50], xmm5
+
+            // SysV call logUnimplementedCall(rdi=info_addr, rsi=caller_ret)
+            emitBytes(slot, &p, &.{ 0x48, 0xBF }); // movabs rdi, info_addr
+            std.mem.writeInt(u64, slot[p..][0..8], info_addr, .little);
+            p += 8;
+            emitBytes(slot, &p, &.{ 0x49, 0x89, 0xDE }); // mov rsi, r11
+            emitBytes(slot, &p, &.{ 0x48, 0xB8 }); // movabs rax, logger_addr
+            std.mem.writeInt(u64, slot[p..][0..8], logger_addr, .little);
+            p += 8;
+            emitBytes(slot, &p, &.{ 0xFF, 0xD0 }); // call rax
+
+            // Restore XMM0..XMM5 & stack
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x44, 0x24, 0x00 }); // movups xmm0, [rsp+0x00]
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x4C, 0x24, 0x10 }); // movups xmm1, [rsp+0x10]
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x54, 0x24, 0x20 }); // movups xmm2, [rsp+0x20]
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x5C, 0x24, 0x30 }); // movups xmm3, [rsp+0x30]
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x64, 0x24, 0x40 }); // movups xmm4, [rsp+0x40]
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x6C, 0x24, 0x50 }); // movups xmm5, [rsp+0x50]
+            emitBytes(slot, &p, &.{ 0x48, 0x83, 0xC4, 0x68 }); // add rsp, 0x68
+
+            // Restore Win64 GPRs and return
+            emitBytes(slot, &p, &.{ 0x41, 0x5B, 0x41, 0x5A }); // pop r11, r10
+            emitBytes(slot, &p, &.{ 0x41, 0x59, 0x41, 0x58 }); // pop r9, r8
+            emitBytes(slot, &p, &.{ 0x5A, 0x59, 0x5E, 0x5F }); // pop rdx, rcx, rsi, rdi
+            emitBytes(slot, &p, &.{0xC3}); // ret
         }
 
         return addr;
     }
 };
-
-fn logUnimplementedCall(info: *const StubInfo) callconv(.c) usize {
-    if (std.mem.startsWith(u8, info.name, "__stdio_common_")) return 0;
-    std.log.warn("[CALL] {s}!{s}", .{ info.dll, info.name });
-    return 0;
-}
 
 const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
@@ -235,7 +260,7 @@ pub fn loadAndPatch(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
         applyRelocations(base_ptr, reloc_dir, delta);
     }
 
-    const tramp_size: usize = 64 * 1024;
+    const tramp_size: usize = 512 * 1024;
     var arena = try TrampolineArena.init(tramp_size);
 
     try patchImports(allocator, &arena, base_ptr, import_dir);
@@ -265,7 +290,7 @@ pub fn loadAndPatch(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
         std.log.info("Initialized PE TLS block: addr=0x{x}, raw={d} bytes, zero_fill={d} bytes", .{ tls_block_addr, raw_len, zero_fill });
     }
 
-    patchRageAsserts(image_base);
+    patchRageAsserts(base_addr);
 
     return MappedImage{
         .base_addr = base_addr,
