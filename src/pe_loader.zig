@@ -1,6 +1,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const registry = @import("shims/generated/registry.zig");
+const crt_core = @import("shims/crt_core.zig");
+const xmem = @import("shims/xmem.zig");
+const game_input = @import("shims/game_input.zig");
+const dstorage = @import("shims/dstorage.zig");
+const win32_fs = @import("shims/win32_fs.zig");
 
 const c = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(.{ .x86_64_win = .{} }) ?*anyopaque;
@@ -16,6 +21,7 @@ pub const MappedImage = struct {
     entry_point: usize,
     trampoline_page: [*]u8,
     trampoline_page_size: usize,
+    tls_block_addr: usize,
 
     pub fn deinit(self: *MappedImage) void {
         const ptr: *anyopaque = @ptrFromInt(self.base_addr);
@@ -84,19 +90,19 @@ const TrampolineArena = struct {
     }
 
     fn emit(self: *TrampolineArena, allocator: std.mem.Allocator, dll: []const u8, name: []const u8) !usize {
-        if (self.offset + 32 > self.capacity) return error.OutOfMemory;
+        if (self.offset + 64 > self.capacity) return error.OutOfMemory;
 
         const info = try allocator.create(StubInfo);
         info.* = .{ .dll = dll, .name = name };
 
         const slot = self.base + self.offset;
         const addr = @intFromPtr(slot);
-        self.offset += 32;
+        self.offset += 64;
 
         const info_addr: u64 = @intFromPtr(info);
         const logger_addr: u64 = @intFromPtr(&logUnimplementedCall);
 
-        @memset(slot[0..32], 0x90);
+        @memset(slot[0..64], 0x90);
 
         if (builtin.os.tag == .windows) {
             std.mem.writeInt(u32, slot[0..4], 0x28EC8348, .little);
@@ -108,14 +114,33 @@ const TrampolineArena = struct {
             std.mem.writeInt(u32, slot[26..30], 0x28C48348, .little);
             std.mem.writeInt(u8, slot[30..31], 0xC3, .little);
         } else {
-            std.mem.writeInt(u32, slot[0..4], 0x08EC8348, .little);
-            std.mem.writeInt(u16, slot[4..6], 0xBF48, .little);
-            std.mem.writeInt(u64, slot[6..14], info_addr, .little);
-            std.mem.writeInt(u16, slot[14..16], 0xB848, .little);
-            std.mem.writeInt(u64, slot[16..24], logger_addr, .little);
-            std.mem.writeInt(u16, slot[24..26], 0xD0FF, .little);
-            std.mem.writeInt(u32, slot[26..30], 0x08C48348, .little);
-            std.mem.writeInt(u8, slot[30..31], 0xC3, .little);
+            // Save Win64 non-volatile & volatile regs clobbered by SysV C calls:
+            // push rdi (57), push rsi (56), push rcx (51), push rdx (52)
+            std.mem.writeInt(u32, slot[0..4], 0x52515657, .little);
+            // push r8 (41 50), push r9 (41 51)
+            std.mem.writeInt(u32, slot[4..8], 0x51415041, .little);
+            // push r10 (41 52), push r11 (41 53)
+            std.mem.writeInt(u32, slot[8..12], 0x53415241, .little);
+            // sub rsp, 8 (align stack to 16 bytes for SysV call)
+            std.mem.writeInt(u32, slot[12..16], 0x08EC8348, .little);
+            // movabs rdi, info_addr
+            std.mem.writeInt(u16, slot[16..18], 0xBF48, .little);
+            std.mem.writeInt(u64, slot[18..26], info_addr, .little);
+            // movabs rax, logger_addr
+            std.mem.writeInt(u16, slot[26..28], 0xB848, .little);
+            std.mem.writeInt(u64, slot[28..36], logger_addr, .little);
+            // call rax
+            std.mem.writeInt(u16, slot[36..38], 0xD0FF, .little);
+            // add rsp, 8
+            std.mem.writeInt(u32, slot[38..42], 0x08C48348, .little);
+            // pop r11 (41 5B), pop r10 (41 5A)
+            std.mem.writeInt(u32, slot[42..46], 0x5A415B41, .little);
+            // pop r9 (41 59), pop r8 (41 58)
+            std.mem.writeInt(u32, slot[46..50], 0x58415941, .little);
+            // pop rdx (5A), pop rcx (59), pop rsi (5E), pop rdi (5F)
+            std.mem.writeInt(u32, slot[50..54], 0x5F5E595A, .little);
+            // ret
+            std.mem.writeInt(u8, slot[54..55], 0xC3, .little);
         }
 
         return addr;
@@ -123,12 +148,14 @@ const TrampolineArena = struct {
 };
 
 fn logUnimplementedCall(info: *const StubInfo) callconv(.c) usize {
+    if (std.mem.startsWith(u8, info.name, "__stdio_common_")) return 0;
     std.log.warn("[CALL] {s}!{s}", .{ info.dll, info.name });
     return 0;
 }
 
 const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
+const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
 
 fn readDataDir(opt_bytes: []const u8, index: usize) DataDirectory {
     const off = 112 + index * 8;
@@ -136,6 +163,20 @@ fn readDataDir(opt_bytes: []const u8, index: usize) DataDirectory {
         .virtual_address = std.mem.readInt(u32, opt_bytes[off..][0..4], .little),
         .size = std.mem.readInt(u32, opt_bytes[off + 4 ..][0..4], .little),
     };
+}
+
+fn patchRageAsserts(image_base: usize) void {
+    const assert_rvas = [_]usize{
+        0x0003bf4, // sysMemAllocator::GetAllocatorForPtr fallback warn
+        0x1df7bea, // Rage Quitf/Errorf post-log trap
+        0x2237178, // sysParam / device mount count warn
+    };
+    for (assert_rvas) |rva| {
+        const ptr: *u8 = @ptrFromInt(image_base + rva);
+        if (ptr.* == 0xCC) {
+            ptr.* = 0x90;
+        }
+    }
 }
 
 pub fn loadAndPatch(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !MappedImage {
@@ -170,6 +211,7 @@ pub fn loadAndPatch(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
 
     const import_dir = readDataDir(opt_bytes, IMAGE_DIRECTORY_ENTRY_IMPORT);
     const reloc_dir = readDataDir(opt_bytes, IMAGE_DIRECTORY_ENTRY_BASERELOC);
+    const tls_dir = readDataDir(opt_bytes, IMAGE_DIRECTORY_ENTRY_TLS);
 
     const image_size: usize = size_of_image;
     const base_ptr = try allocExecutableImage(image_base, image_size);
@@ -198,12 +240,40 @@ pub fn loadAndPatch(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
 
     try patchImports(allocator, &arena, base_ptr, import_dir);
 
+    var tls_block_addr: usize = 0;
+    if (tls_dir.virtual_address != 0 and tls_dir.size >= 40) {
+        const tls_hdr = base_ptr + tls_dir.virtual_address;
+        const start_va = std.mem.readInt(u64, tls_hdr[0..8], .little);
+        const end_va = std.mem.readInt(u64, tls_hdr[8..16], .little);
+        const index_va = std.mem.readInt(u64, tls_hdr[16..24], .little);
+        const zero_fill = std.mem.readInt(u32, tls_hdr[32..36], .little);
+
+        const raw_len: usize = if (end_va >= start_va) @intCast(end_va - start_va) else 0;
+        const total_tls_size: usize = raw_len + @as(usize, zero_fill) + 0x1000;
+        const tls_mem = try allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(64), total_tls_size);
+        @memset(tls_mem, 0);
+
+        if (raw_len > 0 and start_va != 0) {
+            const src_ptr: [*]const u8 = @ptrFromInt(@as(usize, @intCast(start_va)));
+            @memcpy(tls_mem[0..raw_len], src_ptr[0..raw_len]);
+        }
+        if (index_va != 0) {
+            const idx_ptr: *u32 = @ptrFromInt(@as(usize, @intCast(index_va)));
+            idx_ptr.* = 0;
+        }
+        tls_block_addr = @intFromPtr(tls_mem.ptr);
+        std.log.info("Initialized PE TLS block: addr=0x{x}, raw={d} bytes, zero_fill={d} bytes", .{ tls_block_addr, raw_len, zero_fill });
+    }
+
+    patchRageAsserts(image_base);
+
     return MappedImage{
         .base_addr = base_addr,
         .image_size = image_size,
         .entry_point = base_addr + address_of_entry_point,
         .trampoline_page = arena.base,
         .trampoline_page_size = tramp_size,
+        .tls_block_addr = tls_block_addr,
     };
 }
 
@@ -308,7 +378,10 @@ fn patchImports(
 
             if (is_ordinal) {
                 const ord: u16 = @truncate(entry & 0xFFFF);
-                if (registry.resolve(dll_name, null, ord)) |ptr| {
+                if (std.ascii.eqlIgnoreCase(dll_name, "gameinput.dll") and ord == 1) {
+                    std.mem.writeInt(u64, iat_slot, @intFromPtr(&game_input.shim_GameInputCreate), .little);
+                    resolved_count += 1;
+                } else if (registry.resolve(dll_name, null, ord)) |ptr| {
                     std.mem.writeInt(u64, iat_slot, ptr, .little);
                     resolved_count += 1;
                 } else {
@@ -321,7 +394,19 @@ fn patchImports(
                 const hint_name_rva: usize = @truncate(entry & 0x7FFFFFFF);
                 const sym_name_ptr: [*:0]const u8 = @ptrCast(base + hint_name_rva + 2);
                 const sym_name = std.mem.span(sym_name_ptr);
-                if (registry.resolve(dll_name, sym_name, null)) |ptr| {
+                if (crt_core.resolve(sym_name)) |ptr| {
+                    std.mem.writeInt(u64, iat_slot, ptr, .little);
+                    resolved_count += 1;
+                } else if (xmem.resolve(sym_name)) |ptr| {
+                    std.mem.writeInt(u64, iat_slot, ptr, .little);
+                    resolved_count += 1;
+                } else if (dstorage.resolve(sym_name)) |ptr| {
+                    std.mem.writeInt(u64, iat_slot, ptr, .little);
+                    resolved_count += 1;
+                } else if (win32_fs.resolve(sym_name)) |ptr| {
+                    std.mem.writeInt(u64, iat_slot, ptr, .little);
+                    resolved_count += 1;
+                } else if (registry.resolve(dll_name, sym_name, null)) |ptr| {
                     std.mem.writeInt(u64, iat_slot, ptr, .little);
                     resolved_count += 1;
                 } else {

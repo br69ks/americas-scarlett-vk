@@ -23,3 +23,5 @@ run_log*.txt
 
 # Auto-generated stub files (recreated via tools/gen_stubs.py)
 src/shims/generated/
+
+ref/
