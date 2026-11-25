@@ -1,0 +1,25 @@
+# Zig build artifacts
+.zig-cache/
+zig-out/
+
+# Extracted console binaries, archives & dumps
+*.exe
+*.dll
+*.rpf
+*.spv
+*.zst
+imports.txt
+clean_imports.txt
+work/
+
+# Editor / OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime trace logs
+run_log*.txt
+*.log
+
+# Auto-generated stub files (recreated via tools/gen_stubs.py)
+src/shims/generated/
