@@ -5,67 +5,132 @@ from pathlib import Path
 from collections import defaultdict
 
 
+def _parse_decimal_or_prefixed_int(value: str) -> int | None:
+    """Parse objdump's decimal ordinal, while tolerating an explicit 0x prefix."""
+    try:
+        return int(value, 0) if value.lower().startswith("0x") else int(value, 10)
+    except ValueError:
+        return None
+
+
 def parse_imports(text: str) -> dict[str, list[tuple[str, int | None]]]:
     """
-    Parses import tables from both `objdump -p` and `llvm-readobj --coff-imports`.
-    Returns { "dll_name.dll": [(func_name, ordinal), ...] }
+    Parse imports from GNU `objdump -p` and `llvm-readobj --coff-imports`.
+
+    GNU objdump's normal PE import rows have these columns:
+        VMA  Ordinal  Hint  Member-Name  Bound-To
+
+    For a named import, the ordinal column is `<none>` and Member-Name is
+    the imported symbol. The Hint is NOT an ordinal. For an ordinal import,
+    the ordinal column contains the ordinal and Member-Name is `<none>`.
+
+    llvm-readobj prints `Symbol: name (hint)` for named imports and an empty
+    symbol name with the actual ordinal for ordinal imports. Its parenthetical
+    number is a hint for named imports, not an ordinal.
+
+    Returns {"dll_name.dll": [(symbol_name_or_Ordinal_N, ordinal_or_none), ...]}.
     """
     imports: dict[str, list[tuple[str, int | None]]] = defaultdict(list)
     current_dll: str | None = None
 
-    llvm_dll_re = re.compile(r"^\s*Name:\s*(\S+\.dll)", re.IGNORECASE)
-    llvm_sym_re = re.compile(r"^\s*Symbol:\s*(\S+)\s*\((\d+)\)")
+    llvm_dll_re = re.compile(r"^\s*Name:\s*(\S+\.dll)\s*$", re.IGNORECASE)
+    llvm_sym_re = re.compile(r"^\s*Symbol:\s*(.*?)\s*\((\d+)\)\s*$")
+    hex_vma_re = re.compile(r"^[0-9a-fA-F]+$")
 
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
 
-        # Handle `objdump -p` DLL header without list indexing
+        # GNU objdump import-directory header.
         if stripped.lower().startswith("dll name:"):
             _, _, dll_part = stripped.partition(":")
             current_dll = dll_part.strip().lower()
             continue
 
-        # Handle `llvm-readobj --coff-imports` DLL header
+        # llvm-readobj import-directory header.
         if m := llvm_dll_re.match(line):
             current_dll = m.group(1).lower()
             continue
 
-        # Stop capturing imports once objdump moves past the Import Tables section
-        if stripped.startswith(("The Export Tables", "PE File Base Relocations", "Sections:")):
+        # Stop capturing after the import directory section in GNU objdump.
+        if stripped.startswith((
+            "The Export Tables",
+            "The Exception Directory",
+            "The Function Table",
+            "The Attribute Certificate Table",
+            "The Base Relocation",
+            "The TLS Directory",
+            "The Load Configuration",
+            "The Debug Directory",
+            "The Resource Directory",
+            "PE File Base Relocations",
+            "Dump of ",
+            "Sections:",
+        )):
             current_dll = None
             continue
 
         if not current_dll:
             continue
 
-        # Handle `llvm-readobj --coff-imports` symbol lines
+        # llvm-readobj --coff-imports:
+        #   Symbol: CreateFileW (123)  -> named import, 123 is the hint
+        #   Symbol:  (17)              -> ordinal import 17
         if m := llvm_sym_re.match(line):
-            name, ordinal = m.group(1), int(m.group(2))
-            if ordinal <= 0xFFFF:
-                imports[current_dll].append((name, ordinal))
+            symbol = m.group(1).strip()
+            value = int(m.group(2), 10)
+            if symbol:
+                imports[current_dll].append((symbol, None))
+            else:
+                imports[current_dll].append((f"Ordinal_{value}", value))
             continue
 
-        # Handle `objdump -p` lines: <vma_hex> <hint_hex> <symbol_name>
         parts = stripped.split()
+        if not parts or not hex_vma_re.fullmatch(parts[0]):
+            continue
+
+        # GNU objdump also prints the terminating all-zero import descriptor
+        # in this section. It is not a symbol row.
+        if len(parts) >= 5 and all(
+            re.fullmatch(r"0+", token) for token in parts[1:]
+        ):
+            continue
+
+        # Current GNU objdump -p format:
+        #   <vma> <ordinal|<none>> <hint|<none>> <member-name> [bound-to]
+        # Crucially, for named imports the actual name is parts[3], not the
+        # hint in parts[2].
+        if len(parts) >= 4:
+            ordinal_token = parts[1]
+            member_name = parts[3]
+
+            if ordinal_token.lower() != "<none>":
+                ordinal = _parse_decimal_or_prefixed_int(ordinal_token)
+                if ordinal is not None and 0 <= ordinal <= 0xFFFF:
+                    imports[current_dll].append((f"Ordinal_{ordinal}", ordinal))
+                continue
+
+            if member_name.lower() != "<none>":
+                imports[current_dll].append((member_name, None))
+            continue
+
+        # Older/compact objdump output accepted by the previous generator:
+        #   <vma> <hint-or-ordinal> <symbol-name-or-<none>>
         if len(parts) >= 3:
-            vma_str, hint_str, name, *_ = parts
-            if not all(c in "0123456789abcdefABCDEF" for c in vma_str):
-                continue
-            if name == "00000000" or hint_str.lower() == "hint/ord":
-                continue
-            if name == "<none>":
+            value_token, name = parts[1], parts[2]
+            if name.lower() == "<none>":
+                # In this compact representation the value is an ordinal.
                 try:
-                    ord_val = int(hint_str, 16)
-                    if ord_val <= 0xFFFF:
-                        imports[current_dll].append((f"Ordinal_{ord_val}", ord_val))
+                    ordinal = int(value_token, 16)
                 except ValueError:
-                    pass
-            else:
+                    ordinal = _parse_decimal_or_prefixed_int(value_token)
+                if ordinal is not None and 0 <= ordinal <= 0xFFFF:
+                    imports[current_dll].append((f"Ordinal_{ordinal}", ordinal))
+            elif name.lower() not in ("bound-to", "member-name"):
                 imports[current_dll].append((name, None))
 
-    # Deduplicate while preserving order
+    # Deduplicate while preserving order.
     for dll in imports:
         seen = set()
         unique = []
@@ -124,7 +189,7 @@ def generate_zig_files(imports: dict[str, list[tuple[str, int | None]]], out_dir
         zig_file.write_text("\n".join(lines), encoding="utf-8")
         module_imports.append(f'pub const {mod_base} = @import("{mod_base}.zig");')
 
-    # Write central IAT lookup registry
+    # Write central IAT lookup registry.
     reg_lines = [
         "// AUTO-GENERATED CENTRAL IAT STUB REGISTRY",
         'const std = @import("std");',
