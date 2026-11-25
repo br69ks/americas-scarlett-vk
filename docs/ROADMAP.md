@@ -2,24 +2,41 @@
 
 A cross-platform (Linux & Windows) High-Level Emulation (HLE) compatibility layer checklist for running `game_scarlett_master.exe` natively on x86-64 PCs using **Vulkan** and **SPIR-V**.
 
+## Status (2026-11-25)
+
+- Linux and Windows builds are green (Zig 0.17.1).
+- The loader now maps the EXE, loads `vcruntime140`/`vcruntime140_1`/`msvcp140`, starts guest threads, and initializes XMem, GameInput, and DStorage.
+- It reaches asset mounting, then dies because `fiDevice::Open` returns a null `RPF9` packfile handle (RVA `0x2237320`).
+- Audit steps 2, 4, 6, and 7 are done; steps 3 and 5 are partial.
+- Tests, the GPU/shader layer, and audio are still missing.
+
 ## Implementation Checklist
 
-- [ ] **Binary Loader:** Map `game_scarlett_master.exe` and the 16 shipped game DLLs (`msvcp140`, `concrt140`, etc.) into host virtual memory with EAT/IAT resolution.
-- [ ] **OS Kernel Shim:** Reimplement `pi-ms-win-core-`, `api-ms-win-crt-`, and `XCRDAPI.dll` threads, sync primitives, timers, and package mounts on Linux/Windows.
-- [ ] **Security & Auth:** Stub out Xbox hypervisor calls, XSP DRM checks, and offline network clients (`libHttpClient.GDK.dll`, `XCurl.dll`, `WINHTTP.dll`).
-- [ ] **Unified Memory (UMA):** Implement `xmem.dll` (`XMemAlloc`/`XMemFree`) to bridge shared allocations to discrete PC RAM and GPU VRAM with dirty-page tracking.
-- [ ] **Asset Streaming:** Emulate `chad.dll` BCPack decompression and map async I/O queues to `io_uring` / Windows async I/O.
-- [ ] **Offline Shader Lifter:** Batch-disassemble all ~26,500+ RDNA 2 shaders into portable **SPIR-V** modules ahead of time.
-- [ ] **Pre-Lifted Shader Pack:** Bundle the lifted `.spv` blobs into a Zstd-compressed, hash-indexed archive with a JIT fallback lifter for edge cases.
-- [ ] **Vulkan Backend:** Translate `d3d12_xs.dll` ring-buffer commands, `xg_xs.dll` texture layouts, mesh shaders, and `XboxBvhBuilder.dll` ray tracing to native Vulkan.
-- [ ] **PSO & Display:** Async-compile the shader pack into a disk-cached `VkPipelineCache`, unlock frame rates, and configure VRR/HDR swapchains via SDL3 (`ext-ms-win-rtcore-ntuser-*`).
-- [ ] **Audio & Input:** Route `XAudio2_9.dll` to FAudio, decode `xapu.dll`/`AcpHal.dll` audio on CPU threads, map `GameInput.dll` to SDL3, and redirect local saves.
-- [ ] **QA & Profiling:** Fix rendering bugs in RenderDoc, minimize RAM-VRAM copies, and stress-test stability under heavy load.
+- [x] **Binary Loader (core):** Map the EXE and its DLLs, apply relocations, resolve the IAT, parse exports, run TLS callbacks and `DllMain`, and expose per-module `GetProcAddress`/`LoadLibrary`. **Remaining:** map all 16 shipped DLLs; GDK DLLs are still HLE shims.
+- [x] **OS Kernel Shim (core):** TEB/PEB with `ProcessParameters`, stack bounds, TLS/FLS, futex-backed sync objects, thread creation, read-write file I/O, and `.pdata` lookup. **Remaining:** full `RtlVirtualUnwind`/SEH dispatch and many lower-level APIs.
+- [ ] **Security & Auth:** **Out of scope.** Xbox hypervisor/XSP DRM/licensing checks are not stubbed; circumventing them is not part of this project.
+- [ ] **Unified Memory (UMA) — partial:** `XMemAlloc`/`XMemVirtualAlloc` use host `mmap` with `MAP_NORESERVE`; `XMemAllocatePhysicalPages` is still a no-op and there is no dirty-page/VRAM tracking.
+- [ ] **Asset Streaming — partial:** DStorage factory/file/queue shims and synchronous reads work; `RPF9` packfile parsing/decryption, BCPack/`chad`, and async queues are not implemented.
+- [ ] **Offline Shader Lifter:** Not started (target: ~26,500 RDNA 2 shaders to SPIR-V).
+- [ ] **Pre-Lifted Shader Pack:** Not started (Zstd `.spv` archive + `VkPipelineCache`).
+- [ ] **Vulkan Backend:** Not started (D3D12→Vulkan, `xg_xs` layouts, mesh shaders, ray tracing).
+- [ ] **PSO & Display:** Not started (async PSO compile, VRR/HDR swapchain).
+- [ ] **Audio & Input — input skeleton only:** `IGameInput` COM singleton exists; XAudio2/FAudio and `xapu`/`AcpHal` are not implemented.
+- [ ] **QA & Profiling:** Not started; no automated tests or CI yet.
+
+## Audit Follow-ups (steps 2–7)
+
+- [x] **2. Truthful crash handling:** `int3` reports RIP−1 and aborts; hard-coded RVA patches are gone.
+- [ ] **3. Signature-aware / fail-safe stubs:** many handwritten shims added, but generated stubs still return `0` instead of failing.
+- [x] **4. Recursive DLL loader:** exports, per-module `GetProcAddress`, TLS callbacks, and `DllMain`.
+- [ ] **5. `.pdata` / SEH — partial:** registration, lookup, context capture, and filters exist; full unwind/EH dispatch is incomplete.
+- [x] **6. Real TEB/PEB + sync:** `ProcessParameters`, TLS callbacks, futex-backed objects, and `clone`-based guest threads.
+- [x] **7. Read-write file I/O:** configurable game/save directories; Linux implementation is complete, Windows path is guarded.
 
 ## Runtime Loading Pipeline
 
 1. **Host Launcher (`americas-loader`):** Starts the native ELF (Linux) or PE (Windows) host wrapper.
-2. **Pre-Lifted Shader Mount:** Loads the Zstd-compressed `.spv` shader pack and disk-cached `VkPipelineCache`.
+2. **Pre-Lifted Shader Mount:** Loads the Zstd-compressed `.spv` shader pack and disk-cached `VkPipelineCache` (not implemented).
 3. **Virtual Memory Mapping:** Allocates executable host pages (`mmap` / `VirtualAlloc`) and copies `.text` and `.data` sections into place for the executable and shipped DLLs.
 4. **IAT & EAT Hooking:** Redirects `api-ms-win-*`, `XCRDAPI.dll`, `xmem.dll`, and `d3d12_xs.dll` imports to native compatibility shim functions (`.x86_64_win`) and logging trampolines.
 5. **Context Initialization:** Initializes the Vulkan device, UMA dirty-page tracker, async I/O workers, and Xbox Thread/Process Environment Block (`GS` segment TEB/PEB) registers.

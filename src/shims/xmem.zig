@@ -22,11 +22,12 @@ fn hostAlloc(lpAddress: ?*anyopaque, dwSize: usize) ?*anyopaque {
         const PROT_WRITE: i32 = 0x2;
         const MAP_PRIVATE: i32 = 0x02;
         const MAP_ANONYMOUS: i32 = 0x20;
+        const MAP_NORESERVE: i32 = 0x4000;
         const MAP_FAILED: usize = @bitCast(@as(isize, -1));
 
-        const ptr = c.mmap(lpAddress, dwSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) orelse return null;
+        const ptr = c.mmap(lpAddress, dwSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) orelse return null;
         if (@intFromPtr(ptr) == MAP_FAILED) {
-            const fallback = c.mmap(null, dwSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0) orelse return null;
+            const fallback = c.mmap(null, dwSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) orelse return null;
             if (@intFromPtr(fallback) == MAP_FAILED) return null;
             return fallback;
         }
@@ -65,23 +66,18 @@ fn shim_XMemFree(pAddress: ?*anyopaque, dwAllocAttributes: u64) callconv(.{ .x86
 }
 
 fn shim_XMemAllocatePhysicalPages(
+    flags: usize,
     numberOfPages: *usize,
-    pageSize: usize,
-    flags: u32,
     pageArray: [*]usize,
 ) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = flags;
     const count = numberOfPages.*;
-    const total_bytes = count * pageSize;
-    const base_ptr = hostAlloc(null, total_bytes) orelse return -2147024882; // E_OUTOFMEMORY
-    const base_addr = @intFromPtr(base_ptr);
 
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        const slot = @as([*]u8, @ptrCast(pageArray)) + i * 8;
-        std.mem.writeInt(usize, slot[0..8], base_addr + i * pageSize, .little);
-    }
-    return 0; // S_OK
+    std.log.info(
+        "[XMEM] XMemAllocatePhysicalPages(flags=0x{x}, count={}, pageArray=0x{x})",
+                 .{ flags, count, @intFromPtr(pageArray) },
+    );
+
+    return 0;
 }
 
 fn shim_XMemMapPhysicalPages(

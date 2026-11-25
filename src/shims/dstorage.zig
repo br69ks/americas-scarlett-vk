@@ -1,6 +1,8 @@
 const std = @import("std");
 const win32_fs = @import("win32_fs.zig");
 
+var g_req_logs = std.atomic.Value(u32).init(0);
+
 const c_stdio = struct {
     extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
     extern "c" fn ftell(stream: *std.c.FILE) c_long;
@@ -126,25 +128,40 @@ fn q_Release(_: *IDStorageQueue) callconv(.{ .x86_64_win = .{} }) u32 {
 }
 fn q_EnqueueRequest(_: *IDStorageQueue, req_ptr: ?[*]const u8) callconv(.{ .x86_64_win = .{} }) void {
     const req = req_ptr orelse return;
-    const options = std.mem.readInt(u64, req[0..8], .little);
-    const src_type = options & 0x1;
+    // DSTORAGE_REQUEST layout (x64):
+    //   0x00 QueueType (u32)
+    //   0x08 Options (u64)
+    //   0x10 Source (ptr, u32 offset, u32 size)
+    //   0x20 Destination (ptr, u32 offset, u32 size)
+    //   0x30 UncompressedSize, 0x34 Reserved
+    const options = std.mem.readInt(u64, req[0x08..0x10], .little);
+    const source_type = (options >> 8) & 1; // 0 = memory, 1 = file
     const dst_addr = std.mem.readInt(usize, req[0x20..0x28], .little);
-    const dst_size = std.mem.readInt(u32, req[0x28..0x2C], .little);
+    const dst_offset = std.mem.readInt(u32, req[0x28..0x2C], .little);
+    const dst_size = std.mem.readInt(u32, req[0x2C..0x30], .little);
     if (dst_addr == 0 or dst_size == 0) return;
-    const dst: [*]u8 = @ptrFromInt(dst_addr);
+    const req_log = g_req_logs.fetchAdd(1, .monotonic);
+    if (req_log < 16) {
+        std.log.info("[DSTORAGE] request src_type={d} dst=0x{x}+0x{x} size=0x{x} src=0x{x} src_off=0x{x}", .{
+            source_type, dst_addr, dst_offset, dst_size,
+            std.mem.readInt(usize, req[0x10..0x18], .little),
+            std.mem.readInt(u32, req[0x18..0x1C], .little),
+        });
+    }
+    const dst: [*]u8 = @ptrFromInt(dst_addr + dst_offset);
 
-    if (src_type == 1) {
-        const src_addr = std.mem.readInt(usize, req[0x08..0x10], .little);
-        const src_size = std.mem.readInt(u32, req[0x10..0x14], .little);
+    if (source_type == 0) {
+        const src_addr = std.mem.readInt(usize, req[0x10..0x18], .little);
+        const src_size = std.mem.readInt(u32, req[0x1C..0x20], .little);
         if (src_addr != 0) {
             const src: [*]const u8 = @ptrFromInt(src_addr);
             const n = @min(src_size, dst_size);
             @memcpy(dst[0..n], src[0..n]);
         }
     } else {
-        const file_addr = std.mem.readInt(usize, req[0x08..0x10], .little);
-        const file_offset = std.mem.readInt(u64, req[0x10..0x18], .little);
-        const file_size = std.mem.readInt(u32, req[0x18..0x1C], .little);
+        const file_addr = std.mem.readInt(usize, req[0x10..0x18], .little);
+        const file_offset = std.mem.readInt(u32, req[0x18..0x1C], .little);
+        const file_size = std.mem.readInt(u32, req[0x1C..0x20], .little);
         if (file_addr != 0) {
             const ds_file: *IDStorageFile = @ptrFromInt(file_addr);
             if (ds_file.fp) |fp| {
@@ -155,6 +172,8 @@ fn q_EnqueueRequest(_: *IDStorageQueue, req_ptr: ?[*]const u8) callconv(.{ .x86_
         }
     }
 }
+
+
 fn q_EnqueueStatus(_: *IDStorageQueue, _: ?*anyopaque, _: u32) callconv(.{ .x86_64_win = .{} }) void {}
 fn q_EnqueueSignal(_: *IDStorageQueue, _: ?*anyopaque, _: u64) callconv(.{ .x86_64_win = .{} }) void {}
 fn q_Submit(_: *IDStorageQueue) callconv(.{ .x86_64_win = .{} }) void {}

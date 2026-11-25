@@ -6,6 +6,8 @@ const xmem = @import("shims/xmem.zig");
 const game_input = @import("shims/game_input.zig");
 const dstorage = @import("shims/dstorage.zig");
 const win32_fs = @import("shims/win32_fs.zig");
+const sync_shims = @import("shims/sync_shims.zig");
+const crt_extra = @import("shims/crt_extra.zig");
 
 const c = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(.{ .x86_64_win = .{} }) ?*anyopaque;
@@ -15,31 +17,51 @@ const c = if (builtin.os.tag == .windows) struct {
     extern "c" fn munmap(addr: ?*anyopaque, len: usize) i32;
 };
 
+pub const DataDirectory = extern struct {
+    virtual_address: u32,
+    size: u32,
+};
+
+pub const Export = struct {
+    /// Null for ordinal-only exports.
+    name: ?[]const u8,
+    ordinal: u32,
+    rva: u32,
+    /// Non-null when the export is a forwarder ("DLL.Function").
+    forwarder: ?[]const u8,
+};
+
 pub const MappedImage = struct {
     base_addr: usize,
     image_size: usize,
     entry_point: usize,
-    trampoline_page: [*]u8,
+    trampoline_page: ?[*]u8,
     trampoline_page_size: usize,
     tls_block_addr: usize,
+    tls_index_va: usize,
+    tls_callbacks: usize,
+    preferred_base: u64,
+    is_dll: bool,
+    import_dir: DataDirectory,
+    export_dir: DataDirectory,
+    pdata_rva: u32,
+    pdata_size: u32,
 
     pub fn deinit(self: *MappedImage) void {
         const ptr: *anyopaque = @ptrFromInt(self.base_addr);
-        const tramp_ptr: *anyopaque = @ptrCast(self.trampoline_page);
         if (builtin.os.tag == .windows) {
             const MEM_RELEASE: u32 = 0x00008000;
             _ = c.VirtualFree(ptr, 0, MEM_RELEASE);
-            _ = c.VirtualFree(tramp_ptr, 0, MEM_RELEASE);
+            if (self.trampoline_page) |tramp| {
+                _ = c.VirtualFree(@ptrCast(tramp), 0, MEM_RELEASE);
+            }
         } else {
             _ = c.munmap(ptr, self.image_size);
-            _ = c.munmap(tramp_ptr, self.trampoline_page_size);
+            if (self.trampoline_page) |tramp| {
+                _ = c.munmap(@ptrCast(tramp), self.trampoline_page_size);
+            }
         }
     }
-};
-
-const DataDirectory = extern struct {
-    virtual_address: u32,
-    size: u32,
 };
 
 const FileHeader = extern struct {
@@ -70,8 +92,8 @@ const ImportDescriptor = extern struct {
     original_first_thunk: u32,
     time_date_stamp: u32,
     forwarder_chain: u32,
-        name: u32,
-        first_thunk: u32,
+    name: u32,
+    first_thunk: u32,
 };
 
 const StubInfo = struct {
@@ -85,7 +107,7 @@ fn logUnimplementedCall(info: *const StubInfo, caller_ret: usize) callconv(.c) u
     return 0;
 }
 
-const TrampolineArena = struct {
+pub const TrampolineArena = struct {
     base: [*]u8,
     capacity: usize,
     offset: usize = 0,
@@ -113,14 +135,14 @@ const TrampolineArena = struct {
         @memset(slot[0..slot_size], 0x90);
 
         if (builtin.os.tag == .windows) {
-            std.mem.writeInt(u32, slot[0..4], 0x28EC8348, .little); // sub rsp, 0x28
-            std.mem.writeInt(u16, slot[4..6], 0xB948, .little); // movabs rcx, info_addr
+            std.mem.writeInt(u32, slot[0..4], 0x28EC8348, .little);
+            std.mem.writeInt(u16, slot[4..6], 0xB948, .little);
             std.mem.writeInt(u64, slot[6..14], info_addr, .little);
-            std.mem.writeInt(u16, slot[14..16], 0xB848, .little); // movabs rax, logger_addr
+            std.mem.writeInt(u16, slot[14..16], 0xB848, .little);
             std.mem.writeInt(u64, slot[16..24], logger_addr, .little);
-            std.mem.writeInt(u16, slot[24..26], 0xD0FF, .little); // call rax
-            std.mem.writeInt(u32, slot[26..30], 0x28C48348, .little); // add rsp, 0x28
-            std.mem.writeInt(u8, slot[30..31], 0xC3, .little); // ret
+            std.mem.writeInt(u16, slot[24..26], 0xD0FF, .little);
+            std.mem.writeInt(u32, slot[26..30], 0x28C48348, .little);
+            std.mem.writeInt(u8, slot[30..31], 0xC3, .little);
         } else {
             var p: usize = 0;
             const emitBytes = struct {
@@ -130,56 +152,46 @@ const TrampolineArena = struct {
                 }
             }.put;
 
-            // Save Win64 caller-saved GPRs clobbered by SysV (8 * 8 = 64 bytes)
-            emitBytes(slot, &p, &.{ 0x57, 0x56, 0x51, 0x52 }); // push rdi, rsi, rcx, rdx
-            emitBytes(slot, &p, &.{ 0x41, 0x50, 0x41, 0x51 }); // push r8, r9
-            emitBytes(slot, &p, &.{ 0x41, 0x52, 0x41, 0x53 }); // push r10, r11
-
-            // Grab original return address from [rsp + 64] into r11 (already saved above)
-            // mov r11, [rsp + 0x40] -> 4c 8b 5c 24 40
+            emitBytes(slot, &p, &.{ 0x57, 0x56, 0x51, 0x52 });
+            emitBytes(slot, &p, &.{ 0x41, 0x50, 0x41, 0x51 });
+            emitBytes(slot, &p, &.{ 0x41, 0x52, 0x41, 0x53 });
             emitBytes(slot, &p, &.{ 0x4C, 0x8B, 0x5C, 0x24, 0x40 });
-
-            // Reserve 0x68 bytes: 0x60 for XMM0..XMM5 + 0x08 to align RSP to 16 bytes for `call`
-            emitBytes(slot, &p, &.{ 0x48, 0x83, 0xEC, 0x68 }); // sub rsp, 0x68
-            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x44, 0x24, 0x00 }); // movups [rsp+0x00], xmm0
-            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x4C, 0x24, 0x10 }); // movups [rsp+0x10], xmm1
-            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x54, 0x24, 0x20 }); // movups [rsp+0x20], xmm2
-            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x5C, 0x24, 0x30 }); // movups [rsp+0x30], xmm3
-            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x64, 0x24, 0x40 }); // movups [rsp+0x40], xmm4
-            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x6C, 0x24, 0x50 }); // movups [rsp+0x50], xmm5
-
-            // SysV call logUnimplementedCall(rdi=info_addr, rsi=caller_ret)
-            emitBytes(slot, &p, &.{ 0x48, 0xBF }); // movabs rdi, info_addr
+            emitBytes(slot, &p, &.{ 0x48, 0x83, 0xEC, 0x68 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x44, 0x24, 0x00 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x4C, 0x24, 0x10 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x54, 0x24, 0x20 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x5C, 0x24, 0x30 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x64, 0x24, 0x40 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x11, 0x6C, 0x24, 0x50 });
+            emitBytes(slot, &p, &.{ 0x48, 0xBF });
             std.mem.writeInt(u64, slot[p..][0..8], info_addr, .little);
             p += 8;
-            emitBytes(slot, &p, &.{ 0x49, 0x89, 0xDE }); // mov rsi, r11
-            emitBytes(slot, &p, &.{ 0x48, 0xB8 }); // movabs rax, logger_addr
+            emitBytes(slot, &p, &.{ 0x49, 0x89, 0xDE });
+            emitBytes(slot, &p, &.{ 0x48, 0xB8 });
             std.mem.writeInt(u64, slot[p..][0..8], logger_addr, .little);
             p += 8;
-            emitBytes(slot, &p, &.{ 0xFF, 0xD0 }); // call rax
-
-            // Restore XMM0..XMM5 & stack
-            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x44, 0x24, 0x00 }); // movups xmm0, [rsp+0x00]
-            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x4C, 0x24, 0x10 }); // movups xmm1, [rsp+0x10]
-            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x54, 0x24, 0x20 }); // movups xmm2, [rsp+0x20]
-            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x5C, 0x24, 0x30 }); // movups xmm3, [rsp+0x30]
-            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x64, 0x24, 0x40 }); // movups xmm4, [rsp+0x40]
-            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x6C, 0x24, 0x50 }); // movups xmm5, [rsp+0x50]
-            emitBytes(slot, &p, &.{ 0x48, 0x83, 0xC4, 0x68 }); // add rsp, 0x68
-
-            // Restore Win64 GPRs and return
-            emitBytes(slot, &p, &.{ 0x41, 0x5B, 0x41, 0x5A }); // pop r11, r10
-            emitBytes(slot, &p, &.{ 0x41, 0x59, 0x41, 0x58 }); // pop r9, r8
-            emitBytes(slot, &p, &.{ 0x5A, 0x59, 0x5E, 0x5F }); // pop rdx, rcx, rsi, rdi
-            emitBytes(slot, &p, &.{0xC3}); // ret
+            emitBytes(slot, &p, &.{ 0xFF, 0xD0 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x44, 0x24, 0x00 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x4C, 0x24, 0x10 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x54, 0x24, 0x20 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x5C, 0x24, 0x30 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x64, 0x24, 0x40 });
+            emitBytes(slot, &p, &.{ 0x0F, 0x10, 0x6C, 0x24, 0x50 });
+            emitBytes(slot, &p, &.{ 0x48, 0x83, 0xC4, 0x68 });
+            emitBytes(slot, &p, &.{ 0x41, 0x5B, 0x41, 0x5A });
+            emitBytes(slot, &p, &.{ 0x41, 0x59, 0x41, 0x58 });
+            emitBytes(slot, &p, &.{ 0x5A, 0x59, 0x5E, 0x5F });
+            emitBytes(slot, &p, &.{0xC3});
         }
 
         return addr;
     }
 };
 
+const IMAGE_DIRECTORY_ENTRY_EXPORT: usize = 0;
 const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
+const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
 const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
 
 fn readDataDir(opt_bytes: []const u8, index: usize) DataDirectory {
@@ -190,21 +202,8 @@ fn readDataDir(opt_bytes: []const u8, index: usize) DataDirectory {
     };
 }
 
-fn patchRageAsserts(image_base: usize) void {
-    const assert_rvas = [_]usize{
-        0x0003bf4, // sysMemAllocator::GetAllocatorForPtr fallback warn
-        0x1df7bea, // Rage Quitf/Errorf post-log trap
-        0x2237178, // sysParam / device mount count warn
-    };
-    for (assert_rvas) |rva| {
-        const ptr: *u8 = @ptrFromInt(image_base + rva);
-        if (ptr.* == 0xCC) {
-            ptr.* = 0x90;
-        }
-    }
-}
-
-pub fn loadAndPatch(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !MappedImage {
+/// Map a PE image and apply relocations/TLS, but do not touch imports yet.
+pub fn mapImage(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !MappedImage {
     const file_bytes = try std.Io.Dir.cwd().readFileAlloc(
         io,
         path,
@@ -214,33 +213,36 @@ pub fn loadAndPatch(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
     defer allocator.free(file_bytes);
 
     if (file_bytes.len < 64) return error.InvalidPe;
-    const dos_magic = std.mem.readInt(u16, file_bytes[0..2], .little);
-    if (dos_magic != 0x5A4D) return error.InvalidDosMagic;
+    if (std.mem.readInt(u16, file_bytes[0..2], .little) != 0x5A4D) return error.InvalidDosMagic;
 
     const e_lfanew = std.mem.readInt(i32, file_bytes[60..64], .little);
     const nt_offset: usize = @intCast(e_lfanew);
-    const pe_sig = std.mem.readInt(u32, file_bytes[nt_offset..][0..4], .little);
-    if (pe_sig != 0x00004550) return error.InvalidPeSignature;
+    if (std.mem.readInt(u32, file_bytes[nt_offset..][0..4], .little) != 0x00004550) return error.InvalidPeSignature;
 
     const file_hdr: *const FileHeader = @ptrCast(@alignCast(file_bytes[nt_offset + 4 ..].ptr));
     const opt_offset = nt_offset + 4 + @sizeOf(FileHeader);
     const opt_bytes = file_bytes[opt_offset..];
 
-    const opt_magic = std.mem.readInt(u16, opt_bytes[0..2], .little);
-    if (opt_magic != 0x20B) return error.NotPe32Plus;
+    if (std.mem.readInt(u16, opt_bytes[0..2], .little) != 0x20B) return error.NotPe32Plus;
 
     const address_of_entry_point = std.mem.readInt(u32, opt_bytes[16..20], .little);
-    const image_base = std.mem.readInt(u64, opt_bytes[24..32], .little);
+    const preferred_base = std.mem.readInt(u64, opt_bytes[24..32], .little);
     const size_of_image = std.mem.readInt(u32, opt_bytes[56..60], .little);
     const size_of_headers = std.mem.readInt(u32, opt_bytes[60..64], .little);
+
+    if (size_of_image == 0 or size_of_image > 0x4000_0000) return error.InvalidImageSize;
+    if (size_of_headers > size_of_image) return error.InvalidHeaders;
 
     const import_dir = readDataDir(opt_bytes, IMAGE_DIRECTORY_ENTRY_IMPORT);
     const reloc_dir = readDataDir(opt_bytes, IMAGE_DIRECTORY_ENTRY_BASERELOC);
     const tls_dir = readDataDir(opt_bytes, IMAGE_DIRECTORY_ENTRY_TLS);
+    const export_dir = readDataDir(opt_bytes, IMAGE_DIRECTORY_ENTRY_EXPORT);
+    const pdata_dir = readDataDir(opt_bytes, IMAGE_DIRECTORY_ENTRY_EXCEPTION);
 
     const image_size: usize = size_of_image;
-    const base_ptr = try allocExecutableImage(image_base, image_size);
+    const base_ptr = try allocExecutableImage(preferred_base, image_size);
     const base_addr = @intFromPtr(base_ptr);
+    @memset(base_ptr[0..image_size], 0);
 
     @memcpy(base_ptr[0..size_of_headers], file_bytes[0..size_of_headers]);
 
@@ -248,58 +250,223 @@ pub fn loadAndPatch(allocator: std.mem.Allocator, io: std.Io, path: []const u8) 
     var s: usize = 0;
     while (s < file_hdr.number_of_sections) : (s += 1) {
         const cur_sec_off = sec_offset + s * @sizeOf(SectionHeader);
+        if (cur_sec_off + @sizeOf(SectionHeader) > file_bytes.len) return error.InvalidSectionTable;
         const sec: *const SectionHeader = @ptrCast(@alignCast(file_bytes[cur_sec_off..].ptr));
         if (sec.size_of_raw_data == 0) continue;
+        if (sec.virtual_address + sec.size_of_raw_data > image_size) return error.SectionOutOfBounds;
+        if (sec.pointer_to_raw_data + sec.size_of_raw_data > file_bytes.len) return error.SectionOutOfBounds;
         const dst = base_ptr[sec.virtual_address..][0..sec.size_of_raw_data];
         const src = file_bytes[sec.pointer_to_raw_data..][0..sec.size_of_raw_data];
         @memcpy(dst, src);
     }
 
-    const delta: i64 = @as(i64, @intCast(base_addr)) - @as(i64, @intCast(image_base));
-    if (delta != 0) {
-        applyRelocations(base_ptr, reloc_dir, delta);
-    }
-
-    const tramp_size: usize = 512 * 1024;
-    var arena = try TrampolineArena.init(tramp_size);
-
-    try patchImports(allocator, &arena, base_ptr, import_dir);
+    const delta: i64 = @as(i64, @intCast(base_addr)) - @as(i64, @intCast(preferred_base));
+    if (delta != 0) applyRelocations(base_ptr, reloc_dir, delta);
 
     var tls_block_addr: usize = 0;
+    var tls_index_va: usize = 0;
+    var tls_callbacks: usize = 0;
     if (tls_dir.virtual_address != 0 and tls_dir.size >= 40) {
         const tls_hdr = base_ptr + tls_dir.virtual_address;
         const start_va = std.mem.readInt(u64, tls_hdr[0..8], .little);
         const end_va = std.mem.readInt(u64, tls_hdr[8..16], .little);
         const index_va = std.mem.readInt(u64, tls_hdr[16..24], .little);
+        const callbacks_va = std.mem.readInt(u64, tls_hdr[24..32], .little);
         const zero_fill = std.mem.readInt(u32, tls_hdr[32..36], .little);
 
         const raw_len: usize = if (end_va >= start_va) @intCast(end_va - start_va) else 0;
         const total_tls_size: usize = raw_len + @as(usize, zero_fill) + 0x1000;
         const tls_mem = try allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(64), total_tls_size);
         @memset(tls_mem, 0);
-
         if (raw_len > 0 and start_va != 0) {
             const src_ptr: [*]const u8 = @ptrFromInt(@as(usize, @intCast(start_va)));
             @memcpy(tls_mem[0..raw_len], src_ptr[0..raw_len]);
         }
-        if (index_va != 0) {
-            const idx_ptr: *u32 = @ptrFromInt(@as(usize, @intCast(index_va)));
-            idx_ptr.* = 0;
-        }
         tls_block_addr = @intFromPtr(tls_mem.ptr);
-        std.log.info("Initialized PE TLS block: addr=0x{x}, raw={d} bytes, zero_fill={d} bytes", .{ tls_block_addr, raw_len, zero_fill });
+        tls_index_va = @intCast(index_va);
+        tls_callbacks = @intCast(callbacks_va);
+        std.log.info("TLS block: addr=0x{x}, raw={d}, zero_fill={d}, index_va=0x{x}", .{
+            tls_block_addr, raw_len, zero_fill, tls_index_va,
+        });
     }
-
-    patchRageAsserts(base_addr);
 
     return MappedImage{
         .base_addr = base_addr,
         .image_size = image_size,
         .entry_point = base_addr + address_of_entry_point,
-        .trampoline_page = arena.base,
-        .trampoline_page_size = tramp_size,
+        .trampoline_page = null,
+        .trampoline_page_size = 0,
         .tls_block_addr = tls_block_addr,
+        .tls_index_va = tls_index_va,
+        .tls_callbacks = tls_callbacks,
+        .preferred_base = preferred_base,
+        .is_dll = (file_hdr.characteristics & 0x2000) != 0,
+        .import_dir = import_dir,
+        .export_dir = export_dir,
+        .pdata_rva = pdata_dir.virtual_address,
+        .pdata_size = pdata_dir.size,
     };
+}
+
+/// Parse the export directory. Names and forwarder strings point into the
+/// mapped image, so the returned slice must not outlive it.
+pub fn parseExports(allocator: std.mem.Allocator, image: *const MappedImage) ![]Export {
+    if (image.export_dir.virtual_address == 0 or image.export_dir.size < 40) {
+        return allocator.alloc(Export, 0);
+    }
+    const base: [*]u8 = @ptrFromInt(image.base_addr);
+    const ed = base + image.export_dir.virtual_address;
+    const ordinal_base = std.mem.readInt(u32, ed[16..20], .little);
+    const number_of_functions = std.mem.readInt(u32, ed[20..24], .little);
+    const number_of_names = std.mem.readInt(u32, ed[24..28], .little);
+    const address_of_functions = std.mem.readInt(u32, ed[28..32], .little);
+    const address_of_names = std.mem.readInt(u32, ed[32..36], .little);
+    const address_of_name_ordinals = std.mem.readInt(u32, ed[36..40], .little);
+
+    if (number_of_functions > 65536 or number_of_names > 65536) return error.InvalidExportTable;
+
+    const exports = try allocator.alloc(Export, number_of_functions);
+    for (exports, 0..) |*e, i| {
+        const rva = std.mem.readInt(u32, (base + address_of_functions + i * 4)[0..4], .little);
+        e.* = .{
+            .name = null,
+            .ordinal = ordinal_base + @as(u32, @intCast(i)),
+            .rva = rva,
+            .forwarder = null,
+        };
+        if (rva >= image.export_dir.virtual_address and
+            rva < image.export_dir.virtual_address + image.export_dir.size)
+        {
+            e.forwarder = std.mem.span(@as([*:0]const u8, @ptrCast(base + rva)));
+        }
+    }
+
+    var i: usize = 0;
+    while (i < number_of_names) : (i += 1) {
+        const name_rva = std.mem.readInt(u32, (base + address_of_names + i * 4)[0..4], .little);
+        const ord_index = std.mem.readInt(u16, (base + address_of_name_ordinals + i * 2)[0..2], .little);
+        if (ord_index >= exports.len) continue;
+        exports[ord_index].name = std.mem.span(@as([*:0]const u8, @ptrCast(base + name_rva)));
+    }
+    return exports;
+}
+
+pub const ImportResolver = struct {
+    ctx: *anyopaque,
+    resolve: *const fn (ctx: *anyopaque, dll: []const u8, name: ?[]const u8, ordinal: ?u16) ?usize,
+    arena: ?*TrampolineArena = null,
+    allocator: ?std.mem.Allocator = null,
+};
+
+pub const ImportStats = struct {
+    total: usize = 0,
+    resolved: usize = 0,
+    trampolines: usize = 0,
+    missing: usize = 0,
+};
+
+pub fn patchImports(image: *const MappedImage, resolver: ImportResolver) !ImportStats {
+    if (image.import_dir.virtual_address == 0) return .{};
+    const base: [*]u8 = @ptrFromInt(image.base_addr);
+    const import_dir = image.import_dir;
+    var stats = ImportStats{};
+
+    var idx: usize = 0;
+    while (true) : (idx += 1) {
+        const desc_off = import_dir.virtual_address + idx * @sizeOf(ImportDescriptor);
+        const cur_desc: *const ImportDescriptor = @ptrCast(@alignCast(base + desc_off));
+        if (cur_desc.name == 0) break;
+
+        const dll_name = std.mem.span(@as([*:0]const u8, @ptrCast(base + cur_desc.name)));
+        const lookup_rva = if (cur_desc.original_first_thunk != 0)
+            cur_desc.original_first_thunk
+        else
+            cur_desc.first_thunk;
+
+        var t: usize = 0;
+        while (true) : (t += 1) {
+            const thunk_byte_off = t * 8;
+            const entry = std.mem.readInt(u64, (base + lookup_rva + thunk_byte_off)[0..8], .little);
+            if (entry == 0) break;
+            stats.total += 1;
+
+            const iat_slot = (base + cur_desc.first_thunk + thunk_byte_off)[0..8];
+            const is_ordinal = (entry & (@as(u64, 1) << 63)) != 0;
+            var name_opt: ?[]const u8 = null;
+            var ord_opt: ?u16 = null;
+            if (is_ordinal) {
+                ord_opt = @truncate(entry & 0xFFFF);
+            } else {
+                const hint_name_rva: usize = @truncate(entry & 0x7FFFFFFF);
+                name_opt = std.mem.span(@as([*:0]const u8, @ptrCast(base + hint_name_rva + 2)));
+            }
+
+            if (resolver.resolve(resolver.ctx, dll_name, name_opt, ord_opt)) |ptr| {
+                std.mem.writeInt(u64, iat_slot, ptr, .little);
+                stats.resolved += 1;
+            } else if (resolver.arena) |arena| {
+                const allocator = resolver.allocator orelse return error.ResolverHasNoAllocator;
+                const label = if (name_opt) |n| n else try std.fmt.allocPrint(allocator, "Ordinal_{d}", .{ord_opt.?});
+                const tramp = try arena.emit(allocator, dll_name, label);
+                std.mem.writeInt(u64, iat_slot, tramp, .little);
+                stats.trampolines += 1;
+            } else {
+                stats.missing += 1;
+                if (name_opt) |n| {
+                    std.log.err("[IAT] unresolved {s}!{s}", .{ dll_name, n });
+                } else {
+                    std.log.err("[IAT] unresolved {s}!Ordinal_{d}", .{ dll_name, ord_opt.? });
+                }
+            }
+        }
+    }
+
+    std.log.info("[IAT] imports={d}, resolved={d}, trampolines={d}, missing={d}", .{
+        stats.total, stats.resolved, stats.trampolines, stats.missing,
+    });
+    if (stats.missing != 0) return error.UnresolvedImports;
+    return stats;
+}
+
+fn globalResolve(_: *anyopaque, dll: []const u8, name: ?[]const u8, ordinal: ?u16) ?usize {
+    if (ordinal) |ord| {
+        if (std.ascii.eqlIgnoreCase(dll, "gameinput.dll") and ord == 1) {
+            return @intFromPtr(&game_input.shim_GameInputCreate);
+        }
+        return registry.resolve(dll, null, ord);
+    }
+    const n = name orelse return null;
+    if (sync_shims.resolve(n)) |ptr| return ptr;
+    if (crt_core.resolve(n)) |ptr| return ptr;
+    if (crt_extra.resolve(n)) |ptr| return ptr;
+    if (xmem.resolve(n)) |ptr| return ptr;
+    if (dstorage.resolve(n)) |ptr| return ptr;
+    if (win32_fs.resolve(n)) |ptr| return ptr;
+    return registry.resolve(dll, n, null);
+}
+
+/// Legacy entry point: map the executable, resolve imports with the built-in
+/// shim chain, and fall back to logging trampolines for unknown imports.
+pub fn loadAndPatch(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !MappedImage {
+    var image = try mapImage(allocator, io, path);
+    errdefer image.deinit();
+
+    var arena = try TrampolineArena.init(512 * 1024);
+    image.trampoline_page = arena.base;
+    image.trampoline_page_size = 512 * 1024;
+
+    _ = try patchImports(&image, .{
+        .ctx = undefined,
+        .resolve = globalResolve,
+        .arena = &arena,
+        .allocator = allocator,
+    });
+
+    if (image.tls_index_va != 0) {
+        const idx_ptr: *u32 = @ptrFromInt(image.tls_index_va);
+        idx_ptr.* = 0;
+    }
+    return image;
 }
 
 fn allocExecutableImage(preferred_base: u64, size: usize) ![*]u8 {
@@ -367,81 +534,3 @@ fn applyRelocations(base: [*]u8, reloc_dir: DataDirectory, delta: i64) void {
     }
 }
 
-fn patchImports(
-    allocator: std.mem.Allocator,
-    arena: *TrampolineArena,
-    base: [*]u8,
-    import_dir: DataDirectory,
-) !void {
-    if (import_dir.virtual_address == 0) return;
-
-    var resolved_count: usize = 0;
-    var trampoline_count: usize = 0;
-
-    var idx: usize = 0;
-    while (true) : (idx += 1) {
-        const desc_off = import_dir.virtual_address + idx * @sizeOf(ImportDescriptor);
-        const cur_desc: *const ImportDescriptor = @ptrCast(@alignCast(base + desc_off));
-        if (cur_desc.name == 0) break;
-
-        const dll_name_ptr: [*:0]const u8 = @ptrCast(base + cur_desc.name);
-        const dll_name = std.mem.span(dll_name_ptr);
-
-        const lookup_rva = if (cur_desc.original_first_thunk != 0)
-        cur_desc.original_first_thunk
-        else
-            cur_desc.first_thunk;
-
-        var t: usize = 0;
-        while (true) : (t += 1) {
-            const thunk_byte_off = t * 8;
-            const entry = std.mem.readInt(u64, (base + lookup_rva + thunk_byte_off)[0..8], .little);
-            if (entry == 0) break;
-
-            const iat_slot = (base + cur_desc.first_thunk + thunk_byte_off)[0..8];
-            const is_ordinal = (entry & (@as(u64, 1) << 63)) != 0;
-
-            if (is_ordinal) {
-                const ord: u16 = @truncate(entry & 0xFFFF);
-                if (std.ascii.eqlIgnoreCase(dll_name, "gameinput.dll") and ord == 1) {
-                    std.mem.writeInt(u64, iat_slot, @intFromPtr(&game_input.shim_GameInputCreate), .little);
-                    resolved_count += 1;
-                } else if (registry.resolve(dll_name, null, ord)) |ptr| {
-                    std.mem.writeInt(u64, iat_slot, ptr, .little);
-                    resolved_count += 1;
-                } else {
-                    const owned_name = try std.fmt.allocPrint(allocator, "Ordinal_{d}", .{ord});
-                    const tramp = try arena.emit(allocator, dll_name, owned_name);
-                    std.mem.writeInt(u64, iat_slot, tramp, .little);
-                    trampoline_count += 1;
-                }
-            } else {
-                const hint_name_rva: usize = @truncate(entry & 0x7FFFFFFF);
-                const sym_name_ptr: [*:0]const u8 = @ptrCast(base + hint_name_rva + 2);
-                const sym_name = std.mem.span(sym_name_ptr);
-                if (crt_core.resolve(sym_name)) |ptr| {
-                    std.mem.writeInt(u64, iat_slot, ptr, .little);
-                    resolved_count += 1;
-                } else if (xmem.resolve(sym_name)) |ptr| {
-                    std.mem.writeInt(u64, iat_slot, ptr, .little);
-                    resolved_count += 1;
-                } else if (dstorage.resolve(sym_name)) |ptr| {
-                    std.mem.writeInt(u64, iat_slot, ptr, .little);
-                    resolved_count += 1;
-                } else if (win32_fs.resolve(sym_name)) |ptr| {
-                    std.mem.writeInt(u64, iat_slot, ptr, .little);
-                    resolved_count += 1;
-                } else if (registry.resolve(dll_name, sym_name, null)) |ptr| {
-                    std.mem.writeInt(u64, iat_slot, ptr, .little);
-                    resolved_count += 1;
-                } else {
-                    const tramp = try arena.emit(allocator, dll_name, sym_name);
-                    std.mem.writeInt(u64, iat_slot, tramp, .little);
-                    trampoline_count += 1;
-                }
-            }
-        }
-    }
-
-    std.log.info("IAT patched: {d} resolved, {d} logging trampolines", .{ resolved_count, trampoline_count });
-}

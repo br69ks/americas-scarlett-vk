@@ -55,19 +55,19 @@ fn gi_GetCurrentTimestamp(_: *IGameInput) callconv(.{ .x86_64_win = .{} }) u64 {
 }
 fn gi_GetCurrentReading(_: *IGameInput, _: u32, _: ?*anyopaque, out_reading: *?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
     out_reading.* = null;
-    return -2089877497; // GAMEINPUT_E_READING_NOT_FOUND (0x837A0007)
+    return -2088108029; // GAMEINPUT_E_READING_NOT_FOUND (0x838A0003)
 }
 fn gi_GetNextReading(_: *IGameInput, _: ?*anyopaque, _: u32, _: ?*anyopaque, out_reading: *?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
     out_reading.* = null;
-    return -2089877497;
+    return -2088108029;
 }
 fn gi_GetPreviousReading(_: *IGameInput, _: ?*anyopaque, _: u32, _: ?*anyopaque, out_reading: *?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
     out_reading.* = null;
-    return -2089877497;
+    return -2088108029;
 }
 fn gi_GetTemporalReading(_: *IGameInput, _: u64, _: ?*anyopaque, out_reading: *?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
     out_reading.* = null;
-    return -2089877497;
+    return -2088108029;
 }
 fn gi_RegisterReadingCallback(_: *IGameInput, _: ?*anyopaque, _: u32, _: f32, _: ?*anyopaque, _: ?*anyopaque, token: ?*u64) callconv(.{ .x86_64_win = .{} }) i32 {
     if (token) |t| t.* = 1;

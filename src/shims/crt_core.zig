@@ -1,13 +1,31 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const teb = @import("../teb.zig");
+const sync = @import("../sync.zig");
+const mod = @import("../module.zig");
+
+const c_mmap = struct {
+    extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) ?*anyopaque;
+    extern "c" fn munmap(addr: ?*anyopaque, len: usize) c_int;
+};
 
 const WinFn = *const fn () callconv(.{ .x86_64_win = .{} }) void;
 const WinInitFn = *const fn () callconv(.{ .x86_64_win = .{} }) c_int;
 
 var g_commode: c_int = 0;
+var g_thread_count = std.atomic.Value(u32).init(0);
+var g_thread_logs = std.atomic.Value(u32).init(0);
+var g_thread_failures = std.atomic.Value(u32).init(0);
+
+fn noteThreadFailure() void {
+    const n = g_thread_failures.fetchAdd(1, .monotonic) + 1;
+    if (n >= 32) {
+        std.log.err("[THREAD] aborting after {d} consecutive thread-creation failures", .{n});
+        std.process.exit(71);
+    }
+}
 var g_fmode: c_int = 0;
 var g_app_type: c_int = 2; // _crt_gui_app
-var g_last_error: u32 = 0;
 var next_handle: usize = 0x10000;
 
 fn allocDummyHandle() usize {
@@ -28,11 +46,11 @@ fn logWideStr(prefix: []const u8, wptr: ?[*:0]const u16) void {
 }
 
 fn shim_GetLastError() callconv(.{ .x86_64_win = .{} }) u32 {
-    return g_last_error;
+    return teb.getLastError();
 }
 
 fn shim_SetLastError(err: u32) callconv(.{ .x86_64_win = .{} }) void {
-    g_last_error = err;
+    teb.setLastError(err);
 }
 
 fn shim_initterm(first: ?*const anyopaque, last: ?*const anyopaque) callconv(.{ .x86_64_win = .{} }) void {
@@ -122,30 +140,64 @@ fn shim_IsProcessorFeaturePresent(feature: u32) callconv(.{ .x86_64_win = .{} })
     return 1;
 }
 
-fn shim_GetModuleHandleW(module_name: ?[*:0]const u16) callconv(.{ .x86_64_win = .{} }) usize {
-    if (module_name != null) {
-        logWideStr("[CRT] GetModuleHandleW", module_name);
+fn isSystemDllName(name: []const u8) bool {
+    const exact = [_][]const u8{
+        "kernel32.dll", "ntdll.dll", "user32.dll", "advapi32.dll",
+        "bcrypt.dll", "ws2_32.dll", "winhttp.dll", "mfplat.dll",
+        "mfreadwrite.dll", "gameinput.dll", "xmem.dll", "chad.dll",
+        "d3d12_xs.dll", "xg_xs.dll", "xapu.dll", "acphal.dll", "xcrdapi.dll",
+        "bink2scarlett.dll", "libhttpclient.gdk.dll", "xgameruntime.dll",
+    };
+    for (exact) |e| {
+        if (std.ascii.eqlIgnoreCase(name, e)) return true;
     }
-    return 0x140000000;
+    return std.ascii.startsWithIgnoreCase(name, "api-ms-win-") or
+        std.ascii.startsWithIgnoreCase(name, "ext-ms-win-");
+}
+
+const PSEUDO_SYSTEM_BASE: usize = 0x7FFE_0000;
+
+fn shim_GetModuleHandleW(module_name: ?[*:0]const u16) callconv(.{ .x86_64_win = .{} }) usize {
+    if (module_name) |name| {
+        if (teb.findModuleByNameW(name)) |entry| return entry.DllBase;
+        var utf8: [256]u8 = undefined;
+        const n = std.unicode.utf16LeToUtf8(&utf8, std.mem.span(name)) catch 0;
+        if (isSystemDllName(utf8[0..n])) return PSEUDO_SYSTEM_BASE;
+        logWideStr("[CRT] GetModuleHandleW (not loaded)", name);
+        return 0;
+    }
+    return if (teb.process()) |p| p.peb_ptr.ImageBaseAddress else 0;
 }
 
 fn shim_GetModuleHandleA(module_name: ?[*:0]const u8) callconv(.{ .x86_64_win = .{} }) usize {
     if (module_name) |aptr| {
-        std.log.warn("[CRT] GetModuleHandleA(\"{s}\")", .{std.mem.span(aptr)});
+        const name = std.mem.span(aptr);
+        if (teb.findModuleByName(name)) |entry| return entry.DllBase;
+        if (isSystemDllName(name)) return PSEUDO_SYSTEM_BASE;
+        std.log.warn("[CRT] GetModuleHandleA(\"{s}\") -> not loaded", .{name});
+        return 0;
     }
-    return 0x140000000;
+    return if (teb.process()) |p| p.peb_ptr.ImageBaseAddress else 0;
 }
 
-fn shim_GetProcAddress(module: usize, proc_name: ?[*:0]const u8) callconv(.{ .x86_64_win = .{} }) usize {
-    _ = module;
+fn shim_GetProcAddress(hmodule: usize, proc_name: ?[*:0]const u8) callconv(.{ .x86_64_win = .{} }) usize {
     const name_ptr = proc_name orelse return 0;
     const addr_val = @intFromPtr(name_ptr);
-    if (addr_val < 0x10000) return 0;
+    const base = if (hmodule != 0)
+        hmodule
+    else if (teb.process()) |p| p.peb_ptr.ImageBaseAddress else 0;
+
+    if (addr_val <= 0xFFFF) {
+        const ordinal: u16 = @intCast(addr_val);
+        return mod.getProcAddress(base, null, ordinal, 0) orelse 0;
+    }
 
     const name = std.mem.span(name_ptr);
-    if (resolve(name)) |fn_ptr| {
-        return fn_ptr;
+    if (mod.getProcAddress(base, name, null, 0)) |fn_ptr| return fn_ptr;
+    if (mod.resolve_shim_fn) |f| {
+        if (f(name)) |fn_ptr| return fn_ptr;
     }
+    if (resolve(name)) |fn_ptr| return fn_ptr;
     std.log.warn("[CRT] GetProcAddress(\"{s}\") -> unresolved", .{name});
     return 0;
 }
@@ -424,16 +476,14 @@ fn shim_GetSystemTimeAsFileTime(lpFileTime: *u64) callconv(.{ .x86_64_win = .{} 
 }
 
 fn shim_GetCurrentThreadId() callconv(.{ .x86_64_win = .{} }) u32 {
-    if (builtin.os.tag == .linux) {
-        return @bitCast(@as(i32, @truncate(std.os.linux.gettid())));
-    }
+    if (teb.currentTeb()) |t| return @truncate(t.client_id.unique_thread);
+    if (builtin.os.tag == .linux) return @bitCast(@as(i32, @truncate(std.os.linux.gettid())));
     return 1001;
 }
 
 fn shim_GetCurrentProcessId() callconv(.{ .x86_64_win = .{} }) u32 {
-    if (builtin.os.tag == .linux) {
-        return @bitCast(std.os.linux.getpid());
-    }
+    if (teb.currentTeb()) |t| return @truncate(t.client_id.unique_process);
+    if (builtin.os.tag == .linux) return @bitCast(std.os.linux.getpid());
     return 1000;
 }
 
@@ -487,7 +537,7 @@ fn shim_GetLogicalProcessorInformation(
     const entry_size: u32 = @sizeOf(SystemLogicalProcessorInformation);
     if (buffer == null or return_length.* < entry_size) {
         return_length.* = entry_size;
-        g_last_error = 122; // ERROR_INSUFFICIENT_BUFFER
+        teb.setLastError(122); // ERROR_INSUFFICIENT_BUFFER
         return 0;
     }
 
@@ -508,7 +558,7 @@ fn shim_GetLogicalProcessorInformationEx(
     _ = relationship_type;
     _ = buffer;
     returned_length.* = 0;
-    g_last_error = 120; // ERROR_CALL_NOT_IMPLEMENTED
+    teb.setLastError(120); // ERROR_CALL_NOT_IMPLEMENTED
     return 0;
 }
 
@@ -536,11 +586,11 @@ const cmd_line_w = [_:0]u16{
 };
 
 fn shim_GetCommandLineA() callconv(.{ .x86_64_win = .{} }) [*:0]const u8 {
-    return cmd_line_a;
+    return teb.commandLineA().ptr;
 }
 
 fn shim_GetCommandLineW() callconv(.{ .x86_64_win = .{} }) [*:0]const u16 {
-    return &cmd_line_w;
+    return teb.commandLineW().ptr;
 }
 
 fn shim_tanf(x: f32) callconv(.{ .x86_64_win = .{} }) f32 {
@@ -623,6 +673,8 @@ fn shim_powf(base: f32, exp: f32) callconv(.{ .x86_64_win = .{} }) f32 {
 fn shim_GetStartupInfoW(lpStartupInfo: [*]u8) callconv(.{ .x86_64_win = .{} }) void {
     @memset(lpStartupInfo[0..104], 0);
     std.mem.writeInt(u32, lpStartupInfo[0..4], 104, .little); // cb = sizeof(STARTUPINFOW)
+    std.mem.writeInt(u32, lpStartupInfo[60..64], 1, .little); // dwFlags = STARTF_USESHOWWINDOW
+    std.mem.writeInt(u16, lpStartupInfo[64..66], 1, .little); // wShowWindow = SW_SHOWNORMAL
 }
 
 fn shim_get_narrow_winmain_command_line() callconv(.{ .x86_64_win = .{} }) [*:0]const u8 {
@@ -634,22 +686,19 @@ fn shim_register_thread_local_exe_atexit_callback(cb: ?*anyopaque) callconv(.{ .
 }
 
 fn shim_GetModuleFileNameW(hModule: usize, lpFilename: [*]u16, nSize: u32) callconv(.{ .x86_64_win = .{} }) u32 {
-    _ = hModule;
     if (nSize == 0) return 0;
-    const max_copy = @min(@as(usize, nSize - 1), cmd_line_w.len);
-    var i: usize = 0;
-    while (i < max_copy) : (i += 1) {
-        lpFilename[i] = cmd_line_w[i];
-    }
-    lpFilename[max_copy] = 0;
-    return @intCast(max_copy);
+    const base = if (hModule != 0)
+        hModule
+    else if (teb.process()) |p| p.peb_ptr.ImageBaseAddress else 0;
+    return @intCast(teb.moduleFileNameW(base, lpFilename, nSize));
 }
 
 fn shim_LoadLibraryExW(lpLibFileName: ?[*:0]const u16, hFile: usize, dwFlags: u32) callconv(.{ .x86_64_win = .{} }) usize {
     _ = hFile;
     _ = dwFlags;
-    logWideStr("[LOADER] LoadLibraryExW", lpLibFileName);
-    return 0x140000000;
+    const name = lpLibFileName orelse return 0;
+    if (mod.load_library_fn) |f| return f(name);
+    return 0;
 }
 
 fn shim_InitializeApiImpl(reserved: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
@@ -726,69 +775,159 @@ const ThreadSpawnCtx = struct {
     start_fn: WinThreadProc,
     param: ?*anyopaque,
     tid: u32,
+    stack_size: usize,
+    handle: usize,
 };
 
-fn threadBootstrap(ctx: ThreadSpawnCtx) void {
-    if (builtin.os.tag == .linux) {
-        const page_align = comptime std.mem.Alignment.fromByteUnits(4096);
-        const teb = std.heap.page_allocator.alignedAlloc(u8, page_align, 0x1000) catch return;
-        @memset(teb, 0);
+const LinuxThreadCtx = struct {
+    spawn: ThreadSpawnCtx,
+    ptid: i32 = 0,
+    ctid: i32 = 0,
+};
 
-        const tls_slots = std.heap.page_allocator.alloc(usize, 64) catch return;
-        @memset(tls_slots, 0);
+fn linuxCloneEntry(arg: usize) callconv(.c) u8 {
+    const c: *LinuxThreadCtx = @ptrFromInt(arg);
+    threadBootstrap(c.spawn);
+    return 0;
+}
 
-        const src_tls = if (g_main_tls_addr != 0) g_main_tls_addr else g_tls_block_addr;
-        if (src_tls != 0) {
-            const tls_copy = std.heap.page_allocator.alignedAlloc(
-                u8,
-                comptime std.mem.Alignment.fromByteUnits(64),
-                0x4000,
-            ) catch return;
-            @memset(tls_copy, 0);
-            const src_bytes: [*]const u8 = @ptrFromInt(g_tls_block_addr);
-            @memcpy(tls_copy[0..0x2000], src_bytes[0..0x2000]);
-            std.mem.writeInt(usize, std.mem.sliceAsBytes(tls_slots)[0..8], @intFromPtr(tls_copy.ptr), .little);
-        }
+/// pthread_create's stack handling either commits memory (ENOMEM on an
+/// over-committed host) or rejects a supplied stack (EINVAL).  Raw clone with
+/// a MAP_NORESERVE stack avoids both.  FS/TLS is inherited from the caller.
+fn spawnLinuxThread(stack_size: usize, spawn_ctx: ThreadSpawnCtx) !void {
+    const page: usize = 4096;
+    const total = std.mem.alignForward(usize, @max(stack_size, 256 * 1024) + page, page);
+    const PROT_READ: i32 = 1;
+    const PROT_WRITE: i32 = 2;
+    const MAP_PRIVATE: i32 = 2;
+    const MAP_ANONYMOUS: i32 = 0x20;
+    const MAP_NORESERVE: i32 = 0x4000;
+    const MAP_FAILED: usize = @bitCast(@as(isize, -1));
 
-        const teb_addr = @intFromPtr(teb.ptr);
-        std.mem.writeInt(usize, teb[0x00..][0..8], std.math.maxInt(usize), .little);
-        std.mem.writeInt(usize, teb[0x08..][0..8], 0x7FFFFFFFFFFF, .little);
-        std.mem.writeInt(usize, teb[0x10..][0..8], 0x10000, .little);
-        std.mem.writeInt(usize, teb[0x30..][0..8], teb_addr, .little);
-        std.mem.writeInt(u32, teb[0x40..][0..4], 1000, .little);
-        std.mem.writeInt(u32, teb[0x48..][0..4], ctx.tid, .little);
-        std.mem.writeInt(usize, teb[0x58..][0..8], @intFromPtr(tls_slots.ptr), .little);
+    const mem = c_mmap.mmap(null, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) orelse return error.SystemResources;
+    if (@intFromPtr(mem) == MAP_FAILED) return error.SystemResources;
 
-        const ARCH_SET_GS: usize = 0x1001;
-        _ = std.os.linux.syscall2(.arch_prctl, ARCH_SET_GS, teb_addr);
+    const ctx = std.heap.c_allocator.create(LinuxThreadCtx) catch {
+        _ = c_mmap.munmap(mem, total);
+        return error.OutOfMemory;
+    };
+    ctx.* = .{ .spawn = spawn_ctx };
+
+    const flags: u32 = std.os.linux.CLONE.VM |
+        std.os.linux.CLONE.FS |
+        std.os.linux.CLONE.FILES |
+        std.os.linux.CLONE.SIGHAND |
+        std.os.linux.CLONE.THREAD |
+        std.os.linux.CLONE.SYSVSEM |
+        std.os.linux.CLONE.PARENT_SETTID |
+        std.os.linux.CLONE.CHILD_CLEARTID;
+
+    const stack_top = @intFromPtr(mem) + total;
+    const rc = std.os.linux.clone(
+        &linuxCloneEntry,
+        stack_top,
+        flags,
+        @intFromPtr(ctx),
+        &ctx.ptid,
+        0,
+        &ctx.ctid,
+    );
+    const signed: isize = @bitCast(rc);
+    if (signed < 0) {
+        std.log.err("[THREAD] clone failed: errno={d} stack=0x{x} size=0x{x}", .{ -signed, @intFromPtr(mem), total });
+        std.heap.c_allocator.destroy(ctx);
+        _ = c_mmap.munmap(mem, total);
+        return switch (-signed) {
+            11 => error.SystemResources, // EAGAIN
+            12 => error.OutOfMemory, // ENOMEM
+            else => error.Unexpected,
+        };
     }
+    // The stack and ctx belong to the child now; they are intentionally leaked
+    // because a detached thread cannot unmap the stack it is running on.
+}
 
+fn threadBootstrap(ctx: ThreadSpawnCtx) void {
+    defer _ = g_thread_count.fetchSub(1, .monotonic);
+    defer sync.markThreadExited(ctx.handle);
+    if (mod.thread_attach_fn) |f| f();
+    defer {
+        if (mod.thread_detach_fn) |f| f();
+    }
+    if (builtin.os.tag == .linux) {
+        var rsp: usize = undefined;
+        asm volatile ("movq %%rsp, %[out]" : [out] "=r" (rsp));
+        const stack_base = rsp & ~@as(usize, 0xF);
+        const stack_size = if (ctx.stack_size != 0) ctx.stack_size else 1024 * 1024;
+        _ = teb.initThread(stack_base, stack_base - stack_size, ctx.tid) catch {};
+    }
     _ = ctx.start_fn(ctx.param);
 }
 
 fn shim_CreateThread(
     security_attrs: ?*anyopaque,
-    stack_size: usize,
+    stack_size_arg: usize,
     start_address: ?WinThreadProc,
     parameter: ?*anyopaque,
     creation_flags: u32,
     thread_id: ?*u32,
 ) callconv(.{ .x86_64_win = .{} }) usize {
     _ = security_attrs;
-    _ = stack_size;
     _ = creation_flags;
     const func = start_address orelse return 0;
-    const handle = allocDummyHandle();
-    const tid: u32 = @truncate(handle);
+    const serial = allocDummyHandle();
+    const tid: u32 = @truncate(serial);
     if (thread_id) |tid_out| tid_out.* = tid;
 
-    std.log.info("[THREAD] CreateThread(entry=0x{x}, tid={d})", .{ @intFromPtr(func), tid });
+    const live = g_thread_count.fetchAdd(1, .monotonic);
+    if (live >= 128) {
+        _ = g_thread_count.fetchSub(1, .monotonic);
+        std.log.err("[THREAD] refusing thread {d}: live limit reached", .{tid});
+        noteThreadFailure();
+        return 0;
+    }
 
-    const thread = std.Thread.spawn(.{}, threadBootstrap, .{ThreadSpawnCtx{
+    const handle = sync.createThreadHandle(tid);
+    if (handle == 0) {
+        _ = g_thread_count.fetchSub(1, .monotonic);
+        return 0;
+    }
+
+    const requested_stack: usize = if (stack_size_arg != 0) stack_size_arg else 1024 * 1024;
+    const stack_size: usize = @min(requested_stack, 8 * 1024 * 1024);
+
+    const log_index = g_thread_logs.fetchAdd(1, .monotonic);
+    if (log_index < 24 or log_index % 64 == 0) {
+        std.log.info("[THREAD] CreateThread(entry=0x{x}, tid={d}, handle=0x{x}, live={d}, stack=0x{x})", .{
+            @intFromPtr(func), tid, handle, live, requested_stack,
+        });
+    }
+    const spawn_ctx = ThreadSpawnCtx{
         .start_fn = func,
         .param = parameter,
         .tid = tid,
-    }}) catch return 0;
+        .stack_size = stack_size,
+        .handle = handle,
+    };
+
+    if (builtin.os.tag == .linux) {
+        spawnLinuxThread(stack_size, spawn_ctx) catch |err| {
+            _ = g_thread_count.fetchSub(1, .monotonic);
+            std.log.err("[THREAD] spawn failed for tid={d}: {s}", .{ tid, @errorName(err) });
+            noteThreadFailure();
+            _ = sync.closeHandle(handle);
+            return 0;
+        };
+        return handle;
+    }
+
+    const thread = std.Thread.spawn(.{ .stack_size = stack_size }, threadBootstrap, .{spawn_ctx}) catch |err| {
+        _ = g_thread_count.fetchSub(1, .monotonic);
+        std.log.err("[THREAD] spawn failed for tid={d}: {s}", .{ tid, @errorName(err) });
+        noteThreadFailure();
+        _ = sync.closeHandle(handle);
+        return 0;
+    };
     thread.detach();
     return handle;
 }
@@ -804,15 +943,35 @@ fn shim_Sleep(milliseconds: u32) callconv(.{ .x86_64_win = .{} }) void {
 }
 
 fn shim_LoadLibraryW(lpLibFileName: ?[*:0]const u16) callconv(.{ .x86_64_win = .{} }) usize {
-    logWideStr("[LOADER] LoadLibraryW", lpLibFileName);
-    return 0x140000000;
+    const name = lpLibFileName orelse return 0;
+    if (mod.load_library_fn) |f| return f(name);
+    return 0;
 }
 
 fn shim_LoadLibraryA(lpLibFileName: ?[*:0]const u8) callconv(.{ .x86_64_win = .{} }) usize {
-    if (lpLibFileName) |p| {
-        std.log.warn("[LOADER] LoadLibraryA(\"{s}\")", .{std.mem.span(p)});
-    }
-    return 0x140000000;
+    const name = lpLibFileName orelse return 0;
+    if (mod.load_library_a_fn) |f| return f(name);
+    return 0;
+}
+
+fn shim_LoadLibraryExA(lpLibFileName: ?[*:0]const u8, hFile: usize, dwFlags: u32) callconv(.{ .x86_64_win = .{} }) usize {
+    _ = hFile;
+    _ = dwFlags;
+    return shim_LoadLibraryA(lpLibFileName);
+}
+
+fn shim_FreeLibrary(hModule: usize) callconv(.{ .x86_64_win = .{} }) i32 {
+    if (mod.free_library_fn) |f| return f(hModule);
+    return 0;
+}
+
+fn shim_GetModuleFileNameA(hModule: usize, lpFilename: ?[*]u8, nSize: u32) callconv(.{ .x86_64_win = .{} }) u32 {
+    const out = lpFilename orelse return 0;
+    if (nSize == 0) return 0;
+    const base = if (hModule != 0)
+        hModule
+    else if (teb.process()) |p| p.peb_ptr.ImageBaseAddress else 0;
+    return @intCast(mod.fileNameA(base, out, nSize));
 }
 
 fn shim_wcslen(s: ?[*:0]const u16) callconv(.{ .x86_64_win = .{} }) usize {
@@ -932,6 +1091,85 @@ fn shim_CreateMutexA(
     _ = initial_owner;
     _ = name;
     return allocDummyHandle();
+}
+
+fn shim_TlsAlloc() callconv(.{ .x86_64_win = .{} }) u32 {
+    return teb.tlsAlloc();
+}
+
+fn shim_TlsFree(index: u32) callconv(.{ .x86_64_win = .{} }) i32 {
+    return if (teb.tlsFree(index)) 1 else 0;
+}
+
+fn shim_TlsGetValue(index: u32) callconv(.{ .x86_64_win = .{} }) ?*anyopaque {
+    const value = teb.tlsGet(index);
+    return if (value == 0) null else @ptrFromInt(value);
+}
+
+fn shim_TlsSetValue(index: u32, value: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
+    const addr: usize = if (value) |v| @intFromPtr(v) else 0;
+    return if (teb.tlsSet(index, addr)) 1 else 0;
+}
+
+fn shim_GetEnvironmentStringsW() callconv(.{ .x86_64_win = .{} }) ?[*:0]const u16 {
+    return teb.environmentW();
+}
+
+fn shim_GetEnvironmentStringsA() callconv(.{ .x86_64_win = .{} }) ?[*:0]const u8 {
+    return teb.environmentA();
+}
+
+fn shim_FreeEnvironmentStringsW(_: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
+    return 1;
+}
+
+fn shim_FreeEnvironmentStringsA(_: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
+    return 1;
+}
+
+fn shim_GetCurrentDirectoryW(nBufferLength: u32, lpBuffer: ?[*]u16) callconv(.{ .x86_64_win = .{} }) u32 {
+    const out = lpBuffer orelse return 0;
+    if (nBufferLength == 0) return 0;
+    const src = teb.cwdW();
+    const n = @min(src.len, @as(usize, nBufferLength) - 1);
+    @memcpy(out[0..n], src[0..n]);
+    out[n] = 0;
+    return @intCast(n);
+}
+
+fn shim_GetCurrentDirectoryA(nBufferLength: u32, lpBuffer: ?[*]u8) callconv(.{ .x86_64_win = .{} }) u32 {
+    const out = lpBuffer orelse return 0;
+    if (nBufferLength == 0) return 0;
+    const src = teb.cwdA();
+    const n = @min(src.len, @as(usize, nBufferLength) - 1);
+    @memcpy(out[0..n], src[0..n]);
+    out[n] = 0;
+    return @intCast(n);
+}
+
+fn shim_GetProcessHeap() callconv(.{ .x86_64_win = .{} }) usize {
+    if (teb.process()) |p| return p.peb_ptr.ProcessHeap;
+    return 0x1400000;
+}
+
+fn shim_HeapAlloc(heap: usize, flags: u32, bytes: usize) callconv(.{ .x86_64_win = .{} }) ?*anyopaque {
+    _ = heap;
+    const ptr = std.c.malloc(@max(bytes, 1)) orelse return null;
+    if (flags & 0x8 != 0) @memset(@as([*]u8, @ptrCast(ptr))[0..bytes], 0);
+    return ptr;
+}
+
+fn shim_HeapFree(heap: usize, flags: u32, mem: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
+    _ = heap;
+    _ = flags;
+    std.c.free(mem);
+    return 1;
+}
+
+fn shim_HeapReAlloc(heap: usize, flags: u32, mem: ?*anyopaque, bytes: usize) callconv(.{ .x86_64_win = .{} }) ?*anyopaque {
+    _ = heap;
+    _ = flags;
+    return std.c.realloc(mem, @max(bytes, 1));
 }
 
 pub fn resolve(sym_name: []const u8) ?usize {
@@ -1057,6 +1295,24 @@ pub fn resolve(sym_name: []const u8) ?usize {
         .{ "_purecall", @intFromPtr(&shim_purecall) },
         .{ "InitializeSListHead", @intFromPtr(&shim_InitializeSListHead) },
         .{ "CreateMutexA", @intFromPtr(&shim_CreateMutexA) },
+        .{ "TlsAlloc", @intFromPtr(&shim_TlsAlloc) },
+        .{ "TlsFree", @intFromPtr(&shim_TlsFree) },
+        .{ "TlsGetValue", @intFromPtr(&shim_TlsGetValue) },
+        .{ "TlsSetValue", @intFromPtr(&shim_TlsSetValue) },
+        .{ "GetEnvironmentStringsW", @intFromPtr(&shim_GetEnvironmentStringsW) },
+        .{ "GetEnvironmentStringsA", @intFromPtr(&shim_GetEnvironmentStringsA) },
+        .{ "GetEnvironmentStrings", @intFromPtr(&shim_GetEnvironmentStringsA) },
+        .{ "FreeEnvironmentStringsW", @intFromPtr(&shim_FreeEnvironmentStringsW) },
+        .{ "FreeEnvironmentStringsA", @intFromPtr(&shim_FreeEnvironmentStringsA) },
+        .{ "GetCurrentDirectoryW", @intFromPtr(&shim_GetCurrentDirectoryW) },
+        .{ "GetCurrentDirectoryA", @intFromPtr(&shim_GetCurrentDirectoryA) },
+        .{ "GetProcessHeap", @intFromPtr(&shim_GetProcessHeap) },
+        .{ "HeapAlloc", @intFromPtr(&shim_HeapAlloc) },
+        .{ "HeapFree", @intFromPtr(&shim_HeapFree) },
+        .{ "HeapReAlloc", @intFromPtr(&shim_HeapReAlloc) },
+        .{ "LoadLibraryExA", @intFromPtr(&shim_LoadLibraryExA) },
+        .{ "FreeLibrary", @intFromPtr(&shim_FreeLibrary) },
+        .{ "GetModuleFileNameA", @intFromPtr(&shim_GetModuleFileNameA) },
     };
 
     inline for (map) |entry| {
