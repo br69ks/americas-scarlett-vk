@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const module = @import("module.zig");
+const teb = @import("teb.zig");
 const registry = @import("shims/generated/registry.zig");
 const crt_core = @import("shims/crt_core.zig");
 const xmem = @import("shims/xmem.zig");
@@ -8,6 +10,8 @@ const dstorage = @import("shims/dstorage.zig");
 const win32_fs = @import("shims/win32_fs.zig");
 const sync_shims = @import("shims/sync_shims.zig");
 const crt_extra = @import("shims/crt_extra.zig");
+const wsa = @import("shims/wsa.zig");
+const host_imports = @import("host_imports.zig");
 
 const c = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(.{ .x86_64_win = .{} }) ?*anyopaque;
@@ -38,6 +42,7 @@ pub const MappedImage = struct {
     trampoline_page: ?[*]u8,
     trampoline_page_size: usize,
     tls_block_addr: usize,
+    tls_block_size: usize = 0,
     tls_index_va: usize,
     tls_callbacks: usize,
     preferred_base: u64,
@@ -101,6 +106,31 @@ const StubInfo = struct {
     name: []const u8,
 };
 
+fn simpleHostShim(name: ?[]const u8) bool {
+    const n = name orelse return false;
+    return std.mem.eql(u8, n, "GetSystemTimeAsFileTime") or
+        std.mem.eql(u8, n, "GetCurrentThreadId") or
+        std.mem.eql(u8, n, "GetCurrentProcessId") or
+        std.mem.eql(u8, n, "QueryPerformanceCounter") or
+        std.mem.eql(u8, n, "QueryPerformanceFrequency") or
+        std.mem.eql(u8, n, "GetTickCount64") or
+        std.mem.eql(u8, n, "InitializeSListHead") or
+        std.mem.eql(u8, n, "GetCurrentProcess") or
+        std.mem.eql(u8, n, "GetLastError") or
+        std.mem.eql(u8, n, "SetLastError");
+}
+
+fn needsHostThunk(dll: []const u8) bool {
+    if (host_imports.isHostDll(dll)) return true;
+    const n = std.fs.path.basename(dll);
+    return std.ascii.startsWithIgnoreCase(n, "api-ms-win-core-") or
+        std.ascii.startsWithIgnoreCase(n, "kernel32") or
+        std.ascii.startsWithIgnoreCase(n, "ntdll") or
+        std.ascii.startsWithIgnoreCase(n, "ucrtbase") or
+        std.ascii.startsWithIgnoreCase(n, "msvcp") or
+        std.ascii.startsWithIgnoreCase(n, "vcruntime");
+}
+
 fn logUnimplementedCall(info: *const StubInfo, caller_ret: usize) callconv(.c) usize {
     if (std.mem.startsWith(u8, info.name, "__stdio_common_")) return 0;
     std.log.warn("[CALL] {s}!{s} (from 0x{x})", .{ info.dll, info.name, caller_ret });
@@ -114,9 +144,39 @@ pub const TrampolineArena = struct {
 
     const slot_size = 128;
 
-    fn init(capacity: usize) !TrampolineArena {
+    pub fn init(capacity: usize) !TrampolineArena {
         const ptr = try allocExecutableImage(0, capacity);
         return .{ .base = ptr, .capacity = capacity };
+    }
+
+    pub fn emitThunk(self: *TrampolineArena, target: usize) !usize {
+        if (self.offset + 128 > self.capacity) return error.OutOfMemory;
+        const slot = self.base + self.offset;
+        self.offset += 128;
+        @memset(slot[0..128], 0x90);
+        // Stack-saved guest TEB, host TEB switch, aligned host call.  The
+        // guest TEB is saved on the stack so a callee cannot clobber it, and
+        // RAX/XMM0 are left untouched on return.
+        const template = [_]u8{
+            0x65, 0x4c, 0x8b, 0x1c, 0x25, 0x30, 0x00, 0x00, 0x00, // mov r11, gs:[0x30]
+            0x4d, 0x8b, 0x94, 0x24, 0xf8, 0x1f, 0x00, 0x00, // mov r10, [r11+0x1ff8]
+            0x4d, 0x85, 0xd2,                               // test r10, r10
+            0x74, 0x30,                                     // jz no_host (0x46)
+            0x4d, 0x89, 0xa3, 0xf0, 0x1f, 0x00, 0x00,       // mov [r11+0x1ff0], r12
+            0x4d, 0x89, 0x9a, 0xe0, 0x1f, 0x00, 0x00,       // mov [r10+0x1fe0], r11
+            0xf3, 0x49, 0x0f, 0xae, 0xda,                   // wrgsbase r10
+            0xff, 0x15, 0x34, 0x00, 0x00, 0x00,             // call [rip+0x34] -> 0x60
+            0x65, 0x4c, 0x8b, 0x14, 0x25, 0x30, 0x00, 0x00, 0x00, // mov r10, gs:[0x30] (host)
+            0x4d, 0x8b, 0x9a, 0xe0, 0x1f, 0x00, 0x00,       // mov r11, [r10+0x1fe0]
+            0x4d, 0x8b, 0xa3, 0xf0, 0x1f, 0x00, 0x00,       // mov r12, [r11+0x1ff0]
+            0xf3, 0x49, 0x0f, 0xae, 0xde,                   // wrgsbase r11
+            0xc3,                                           // ret
+            0xff, 0x15, 0x14, 0x00, 0x00, 0x00,             // no_host: call [rip+0x14] -> 0x60
+            0xc3,                                           // ret
+        };
+        @memcpy(slot[0..template.len], &template);
+        std.mem.writeInt(u64, slot[0x60..0x68], target, .little);
+        return @intFromPtr(slot);
     }
 
     fn emit(self: *TrampolineArena, allocator: std.mem.Allocator, dll: []const u8, name: []const u8) !usize {
@@ -264,6 +324,7 @@ pub fn mapImage(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Map
     if (delta != 0) applyRelocations(base_ptr, reloc_dir, delta);
 
     var tls_block_addr: usize = 0;
+    var tls_block_size: usize = 0;
     var tls_index_va: usize = 0;
     var tls_callbacks: usize = 0;
     if (tls_dir.virtual_address != 0 and tls_dir.size >= 40) {
@@ -283,6 +344,7 @@ pub fn mapImage(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Map
             @memcpy(tls_mem[0..raw_len], src_ptr[0..raw_len]);
         }
         tls_block_addr = @intFromPtr(tls_mem.ptr);
+        tls_block_size = total_tls_size;
         tls_index_va = @intCast(index_va);
         tls_callbacks = @intCast(callbacks_va);
         std.log.info("TLS block: addr=0x{x}, raw={d}, zero_fill={d}, index_va=0x{x}", .{
@@ -297,6 +359,7 @@ pub fn mapImage(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Map
         .trampoline_page = null,
         .trampoline_page_size = 0,
         .tls_block_addr = tls_block_addr,
+        .tls_block_size = tls_block_size,
         .tls_index_va = tls_index_va,
         .tls_callbacks = tls_callbacks,
         .preferred_base = preferred_base,
@@ -402,7 +465,14 @@ pub fn patchImports(image: *const MappedImage, resolver: ImportResolver) !Import
             }
 
             if (resolver.resolve(resolver.ctx, dll_name, name_opt, ord_opt)) |ptr| {
-                std.mem.writeInt(u64, iat_slot, ptr, .little);
+                var target = ptr;
+                if (builtin.os.tag == .windows and needsHostThunk(dll_name) and !simpleHostShim(name_opt)) {
+                    if (resolver.arena) |arena| target = try arena.emitThunk(ptr);
+                }
+                std.mem.writeInt(u64, iat_slot, target, .little);
+                if (target < 0x1_0000_0000) {
+                    std.log.err("[IAT] LOW target {s}!{s} -> 0x{x}", .{ dll_name, name_opt orelse "ordinal", target });
+                }
                 stats.resolved += 1;
             } else if (resolver.arena) |arena| {
                 const allocator = resolver.allocator orelse return error.ResolverHasNoAllocator;
@@ -429,10 +499,12 @@ pub fn patchImports(image: *const MappedImage, resolver: ImportResolver) !Import
 }
 
 fn globalResolve(_: *anyopaque, dll: []const u8, name: ?[]const u8, ordinal: ?u16) ?usize {
+    if (host_imports.resolve(dll, name, ordinal)) |ptr| return ptr;
     if (ordinal) |ord| {
         if (std.ascii.eqlIgnoreCase(dll, "gameinput.dll") and ord == 1) {
             return @intFromPtr(&game_input.shim_GameInputCreate);
         }
+        if (wsa.resolveOrdinal(dll, ord)) |ptr| return ptr;
         return registry.resolve(dll, null, ord);
     }
     const n = name orelse return null;
@@ -442,6 +514,7 @@ fn globalResolve(_: *anyopaque, dll: []const u8, name: ?[]const u8, ordinal: ?u1
     if (xmem.resolve(n)) |ptr| return ptr;
     if (dstorage.resolve(n)) |ptr| return ptr;
     if (win32_fs.resolve(n)) |ptr| return ptr;
+    if (wsa.resolve(n)) |ptr| return ptr;
     return registry.resolve(dll, n, null);
 }
 

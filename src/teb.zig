@@ -199,7 +199,9 @@ pub const Process = struct {
     pid: u32,
     tid: u32,
     tls_template: [MAX_TLS_SLOTS]usize = @splat(0),
+    tls_template_sizes: [MAX_TLS_SLOTS]u32 = @splat(0),
     tls_template_len: usize = 0,
+    host_teb: usize = 0,
 };
 
 var g_process: ?*Process = null;
@@ -210,7 +212,27 @@ pub fn process() ?*Process {
     return g_process;
 }
 
+fn readHostTeb() usize {
+    var p: usize = 0;
+    asm volatile ("movq %%gs:0x30, %[out]" : [out] "=r" (p));
+    return p;
+}
+
+fn setGsBase(base: usize) void {
+    asm volatile ("wrgsbase %[base]" :: [base] "r" (base));
+}
+
 pub fn currentTeb() ?*TEB {
+    if (builtin.os.tag == .windows) {
+        var p: usize = 0;
+        asm volatile ("movq %%gs:0x30, %[out]" : [out] "=r" (p));
+        if (p >= 0x10000) return @ptrFromInt(p);
+        if (g_process) |proc| return proc.teb_ptr;
+        return null;
+    }
+    // The loader installs a synthetic GS base only after initProcess(); a plain
+    // host test binary has GS = 0, where `%gs:0x30` would fault at address 0x30.
+    if (g_process == null) return null;
     var p: usize = undefined;
     asm volatile ("movq %%gs:0x30, %[out]"
         : [out] "=r" (p),
@@ -219,13 +241,115 @@ pub fn currentTeb() ?*TEB {
     return @ptrFromInt(p);
 }
 
+pub var g_entry_gs: usize = 0;
+pub var g_guest_teb: usize = 0;
+pub var g_enter_count: usize = 0;
+pub var g_leave_count: usize = 0;
+pub var g_leave_trace: [8]usize = @splat(0);
+pub var g_enter_trace: [8]usize = @splat(0);
+
+pub fn readGsBase() usize {
+    var p: usize = 0;
+    if (builtin.os.tag == .windows) asm volatile ("rdgsbase %[out]" : [out] "=r" (p));
+    return p;
+}
+
+pub fn testGsBase(target: usize) usize {
+    if (builtin.os.tag != .windows) return 0;
+    var orig: usize = 0;
+    asm volatile ("rdgsbase %[out]" : [out] "=r" (orig));
+    setGsBase(target);
+    var got: usize = 0;
+    asm volatile ("rdgsbase %[out]" : [out] "=r" (got));
+    setGsBase(orig);
+    return got;
+}
+
+pub fn enterGuest() void {
+    if (builtin.os.tag != .windows) return;
+    const guest = if (g_process) |p| p.teb_ptr else (currentTeb() orelse return);
+    g_guest_teb = @intFromPtr(guest);
+    g_enter_count += 1;
+    const ra = @returnAddress();
+    g_enter_trace[g_enter_count % 8] = ra;
+    const cur = readGsBase();
+    const guest_addr = @intFromPtr(guest);
+    if (cur >= 0x10000 and cur != guest_addr) {
+        @as(*usize, @ptrFromInt(guest_addr + 0x1FF8)).* = cur;
+    } else if (@as(*const usize, @ptrFromInt(guest_addr + 0x1FF8)).* == 0) {
+        return;
+    }
+    setGsBase(guest_addr);
+}
+
+pub fn forceGuest() void {
+    if (builtin.os.tag != .windows) return;
+    const p = g_process orelse return;
+    const guest_addr = @intFromPtr(p.teb_ptr);
+    var host: usize = @as(*const usize, @ptrFromInt(guest_addr + 0x1FF8)).*;
+    if (host < 0x10000) host = p.host_teb;
+    if (host >= 0x10000) {
+        @as(*usize, @ptrFromInt(guest_addr + 0x1FF8)).* = host;
+        setGsBase(guest_addr);
+    }
+}
+
+pub fn enterHost() void {
+    if (builtin.os.tag != .windows) return;
+    if (readGsBase() != g_guest_teb) return;
+    if (g_guest_teb == 0) return;
+    const guest: *TEB = @ptrFromInt(g_guest_teb);
+    const host = @as(*const usize, @ptrFromInt(@intFromPtr(guest) + 0x1FF8)).*;
+    if (host >= 0x10000) setGsBase(host);
+}
+
+pub fn leaveHost() void {
+    if (builtin.os.tag != .windows) return;
+    if (g_guest_teb >= 0x10000) setGsBase(g_guest_teb);
+}
+
+pub fn restoreGs() callconv(.c) void {
+    if (builtin.os.tag != .windows) return;
+    if (g_guest_teb >= 0x10000) {
+        asm volatile ("wrgsbase %[base]" :: [base] "r" (g_guest_teb));
+    }
+}
+
+pub fn leaveGuest() void {
+    if (builtin.os.tag != .windows) return;
+    g_leave_count += 1;
+    const ra = @returnAddress();
+    g_leave_trace[g_leave_count % 8] = ra;
+    var host: usize = 0;
+    asm volatile ("movq %%gs:0x1FF8, %[out]" : [out] "=r" (host));
+    if (host >= 0x10000) setGsBase(host);
+}
+
+/// Guest TEB for this thread even while a host thunk has switched GS.
+/// Host thunks maintain host TEB+0x28 = guest TEB and host TEB+0x1FF8 = 0.
+fn guestTeb() ?*TEB {
+    if (builtin.os.tag != .windows) return currentTeb();
+    var p: usize = 0;
+    asm volatile ("movq %%gs:0x30, %[out]" : [out] "=r" (p));
+    if (p < 0x10000) {
+        if (g_process) |proc| return proc.teb_ptr;
+        return null;
+    }
+    const guest = @as(*const usize, @ptrFromInt(p + 0x1FE0)).*;
+    if (guest >= 0x10000) {
+        const self = @as(*const usize, @ptrFromInt(guest + 0x30)).*;
+        if (self == guest) return @ptrFromInt(guest);
+    }
+    return @ptrFromInt(p);
+}
+
 pub fn getLastError() u32 {
-    if (currentTeb()) |t| return t.last_error_value;
+    if (guestTeb()) |t| return t.last_error_value;
     return g_fallback_last_error;
 }
 
 pub fn setLastError(value: u32) void {
-    if (currentTeb()) |t| {
+    if (guestTeb()) |t| {
         t.last_error_value = value;
     } else {
         g_fallback_last_error = value;
@@ -407,9 +531,14 @@ pub fn initProcess(
     argv: []const []const u8,
     environ_map: *std.process.Environ.Map,
     game_dir: []const u8,
+    cwd_override: ?[]const u8,
 ) !*Process {
-    const cwd = try currentPath(allocator, io);
-    const abs_exe = if (std.fs.path.isAbsolute(exe_path))
+    const cwd = if (cwd_override) |c|
+        try allocator.dupe(u8, c)
+    else
+        try currentPath(allocator, io);
+    const win_drive = exe_path.len >= 2 and exe_path[1] == ':';
+    const abs_exe = if (win_drive or std.fs.path.isAbsolute(exe_path))
         try allocator.dupe(u8, exe_path)
     else
         try std.fs.path.join(allocator, &.{ cwd, exe_path });
@@ -456,7 +585,7 @@ pub fn initProcess(
     peb.ProcessHeap = 0x1400000;
     peb.BeingDebugged = 0;
 
-    const teb_mem = try allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(4096), TEB_SIZE);
+    const teb_mem = try allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(4096), TEB_SIZE + 0x2800);
     @memset(teb_mem, 0);
     const teb: *TEB = @ptrCast(@alignCast(teb_mem.ptr));
 
@@ -473,11 +602,13 @@ pub fn initProcess(
     @memset(module_tls, 0);
     teb.thread_local_storage_pointer = @intFromPtr(module_tls.ptr);
     teb.process_environment_block = @intFromPtr(peb);
+    g_guest_teb = @intFromPtr(teb);
 
     const p = try allocator.create(Process);
     p.* = .{
         .allocator = allocator,
         .teb_ptr = teb,
+        .host_teb = if (builtin.os.tag == .windows) readHostTeb() else 0,
         .peb_ptr = peb,
         .params = params,
         .ldr = ldr,
@@ -496,6 +627,23 @@ pub fn initProcess(
     };
     g_process = p;
 
+    // Slot 0 is the CRT per-thread data (PTD), not a module TLS template.
+    const crt_tls = try allocator.alloc(u8, 0x10000);
+    @memset(crt_tls, 0);
+    p.tls_template[0] = @intFromPtr(crt_tls.ptr);
+    p.tls_template_sizes[0] = 0x10000;
+    p.tls_template_len = 1;
+    module_tls[0] = @intFromPtr(crt_tls.ptr);
+
+    if (builtin.os.tag == .windows) {
+        const host = readHostTeb();
+        if (host != 0) {
+            @as(*usize, @ptrFromInt(@intFromPtr(teb) + 0x1FF8)).* = host;
+            @as(*usize, @ptrFromInt(host + 0x1FF8)).* = 0;
+            @as(*usize, @ptrFromInt(host + 0x28)).* = @intFromPtr(teb);
+        }
+    }
+
     if (builtin.os.tag == .linux) {
         const ARCH_SET_GS: usize = 0x1001;
         const rc = std.os.linux.syscall2(.arch_prctl, ARCH_SET_GS, @intFromPtr(teb));
@@ -507,13 +655,15 @@ pub fn initProcess(
 
 pub fn initThread(stack_base: usize, stack_limit: usize, tid: u32) !*TEB {
     const p = g_process orelse return error.ProcessNotInitialized;
-    const mem = try std.heap.page_allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(4096), TEB_SIZE);
+    const mem = try std.heap.page_allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(4096), TEB_SIZE + 0x2800);
     @memset(mem, 0);
     const teb: *TEB = @ptrCast(@alignCast(mem.ptr));
 
     const tls_mem = try std.heap.page_allocator.alloc(usize, MAX_TLS_SLOTS);
     @memset(tls_mem, 0);
-    @memcpy(tls_mem[0..p.tls_template_len], p.tls_template[0..p.tls_template_len]);
+    for (0..p.tls_template_len) |i| {
+        tls_mem[i] = cloneTlsBlock(p.tls_template[i], p.tls_template_sizes[i]);
+    }
 
     teb.nt_tib.exception_list = std.math.maxInt(usize);
     teb.nt_tib.stack_base = stack_base;
@@ -522,23 +672,51 @@ pub fn initThread(stack_base: usize, stack_limit: usize, tid: u32) !*TEB {
     teb.client_id = .{ .unique_process = p.pid, .unique_thread = tid };
     teb.thread_local_storage_pointer = @intFromPtr(tls_mem.ptr);
     teb.process_environment_block = @intFromPtr(p.peb_ptr);
+    g_guest_teb = @intFromPtr(teb);
 
     if (builtin.os.tag == .linux) {
         const ARCH_SET_GS: usize = 0x1001;
         const rc = std.os.linux.syscall2(.arch_prctl, ARCH_SET_GS, @intFromPtr(teb));
         if (@as(isize, @bitCast(rc)) != 0) return error.ArchPrctlFailed;
+    } else if (builtin.os.tag == .windows) {
+        const host = readHostTeb();
+        if (host != 0) {
+            @as(*usize, @ptrFromInt(@intFromPtr(teb) + 0x1FF8)).* = host;
+            @as(*usize, @ptrFromInt(host + 0x1FF8)).* = 0;
+            @as(*usize, @ptrFromInt(host + 0x28)).* = @intFromPtr(teb);
+        }
     }
     return teb;
 }
 
+fn cloneTlsBlock(template: usize, size: usize) usize {
+    if (template == 0 or size == 0) return template;
+    const mem = std.heap.page_allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(64), size) catch return template;
+    const src: [*]const u8 = @ptrFromInt(template);
+    @memcpy(mem[0..size], src[0..size]);
+    return @intFromPtr(mem.ptr);
+}
+
 /// Assign the next per-module TLS index and publish the block for future
 /// threads.  The current thread is updated too.
-pub fn allocModuleTls(block: usize) !u16 {
+pub fn allocModuleTls(block: usize, block_size: usize) !u16 {
     const p = g_process orelse return error.ProcessNotInitialized;
     if (p.tls_template_len >= MAX_TLS_SLOTS) return error.TlsSlotsExhausted;
+    if (builtin.os.tag == .windows) {
+        // Guest TLS indexes are image TLS indexes, not host tlsAlloc slots.
+        const index: u16 = @intCast(p.tls_template_len);
+        p.tls_template_len += 1;
+        p.tls_template[index] = block;
+        p.tls_template_sizes[index] = @intCast(block_size);
+        const t: *TEB = p.teb_ptr;
+        const base: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
+        base[index] = cloneTlsBlock(block, block_size);
+        return index;
+    }
     const index: u16 = @intCast(p.tls_template_len);
     p.tls_template_len += 1;
     p.tls_template[index] = block;
+    p.tls_template_sizes[index] = @intCast(block_size);
     if (currentTeb()) |t| {
         const base: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
         base[index] = block;
@@ -546,10 +724,17 @@ pub fn allocModuleTls(block: usize) !u16 {
     return index;
 }
 
-pub fn setModuleTlsCurrent(index: u16, block: usize) void {
+pub fn setModuleTlsCurrent(index: u16, block: usize, block_size: usize) void {
+    if (builtin.os.tag == .windows) {
+        if (g_process) |p| {
+            const base: [*]usize = @ptrFromInt(p.teb_ptr.thread_local_storage_pointer);
+            if (index < MAX_TLS_SLOTS) base[index] = cloneTlsBlock(block, block_size);
+            return;
+        }
+    }
     if (currentTeb()) |t| {
         const base: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
-        if (index < MAX_TLS_SLOTS) base[index] = block;
+        if (index < MAX_TLS_SLOTS) base[index] = cloneTlsBlock(block, block_size);
     }
 }
 
@@ -558,7 +743,11 @@ pub fn tlsAlloc() u32 {
         const cur = g_tls_bitmap.load(.acquire);
         const free_bits = ~cur;
         if (free_bits == 0) return 0xFFFFFFFF;
-        const index: u32 = @ctz(free_bits);
+        const index: u32 = if (builtin.os.tag == .windows)
+            @intCast(MAX_TLS_SLOTS - 1 - @ctz(free_bits))
+        else
+            @intCast(@ctz(free_bits));
+        if (index >= MAX_TLS_SLOTS) return 0xFFFFFFFF;
         const new = cur | (@as(u64, 1) << @intCast(index));
         if (g_tls_bitmap.cmpxchgWeak(cur, new, .acq_rel, .acquire) == null) return index;
     }
@@ -572,20 +761,27 @@ pub fn tlsFree(index: u32) bool {
         if (cur & bit == 0) return false;
         if (g_tls_bitmap.cmpxchgWeak(cur, cur & ~bit, .acq_rel, .acquire) == null) break;
     }
-    if (currentTeb()) |t| t.tls_slots[index] = 0;
+    if (currentTeb()) |t| {
+        const base: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
+        base[index] = 0;
+    }
     return true;
 }
 
 pub fn tlsGet(index: u32) usize {
     if (index >= MAX_TLS_SLOTS) return 0;
-    if (currentTeb()) |t| return t.tls_slots[index];
+    if (currentTeb()) |t| {
+        const base: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
+        return base[index];
+    }
     return 0;
 }
 
 pub fn tlsSet(index: u32, value: usize) bool {
     if (index >= MAX_TLS_SLOTS) return false;
     if (currentTeb()) |t| {
-        t.tls_slots[index] = value;
+        const base: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
+        base[index] = value;
         return true;
     }
     return false;
@@ -708,4 +904,15 @@ pub fn moduleFileNameW(base: usize, out: [*]u16, cap: usize) usize {
     @memcpy(out[0..len], buf[0..len]);
     out[len] = 0;
     return len;
+}
+
+
+test "TEB/PEB layout offsets" {
+    try std.testing.expectEqual(@as(usize, 0x00), @offsetOf(TEB, "nt_tib"));
+    try std.testing.expectEqual(@as(usize, 0x40), @offsetOf(TEB, "client_id"));
+    try std.testing.expectEqual(@as(usize, 0x58), @offsetOf(TEB, "thread_local_storage_pointer"));
+    try std.testing.expectEqual(@as(usize, 0x60), @offsetOf(TEB, "process_environment_block"));
+    try std.testing.expectEqual(@as(usize, 0x1480), @offsetOf(TEB, "tls_slots"));
+    try std.testing.expectEqual(@as(usize, 0x10), @offsetOf(PEB, "ImageBaseAddress"));
+    try std.testing.expectEqual(@as(usize, 0x20), @offsetOf(PEB, "ProcessParameters"));
 }

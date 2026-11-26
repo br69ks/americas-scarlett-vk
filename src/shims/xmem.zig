@@ -9,14 +9,26 @@ const c = if (builtin.os.tag == .windows) struct {
     extern "c" fn munmap(addr: ?*anyopaque, len: usize) i32;
 };
 
-fn hostAlloc(lpAddress: ?*anyopaque, dwSize: usize) ?*anyopaque {
+fn hostAlloc(lpAddress: ?*anyopaque, dwSize: usize, alloc_type: u32, protect: u32) ?*anyopaque {
     if (dwSize == 0) return null;
     if (builtin.os.tag == .windows) {
         const MEM_COMMIT: u32 = 0x00001000;
         const MEM_RESERVE: u32 = 0x00002000;
         const PAGE_READWRITE: u32 = 0x04;
-        return c.VirtualAlloc(lpAddress, dwSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) orelse
-        c.VirtualAlloc(null, dwSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+        const requested = alloc_type & (MEM_COMMIT | MEM_RESERVE);
+        const typ = if (requested != 0) requested else MEM_COMMIT | MEM_RESERVE;
+        const prot = if (protect != 0) protect else PAGE_READWRITE;
+        if (c.VirtualAlloc(lpAddress, dwSize, typ, prot)) |p| return p;
+        // Xbox protection values (e.g. 0x21) are not Windows PAGE_* flags.
+        const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+        if (c.VirtualAlloc(lpAddress, dwSize, typ, PAGE_EXECUTE_READWRITE)) |p| return p;
+        if (c.VirtualAlloc(lpAddress, dwSize, typ, PAGE_READWRITE)) |p| return p;
+        // A 24 GiB commit can exceed the guest's commit limit; reserve it so
+        // later XMem commit calls can commit pieces on demand.
+        if ((typ & MEM_COMMIT) != 0) {
+            if (c.VirtualAlloc(lpAddress, dwSize, MEM_RESERVE, PAGE_EXECUTE_READWRITE)) |p| return p;
+        }
+        return c.VirtualAlloc(null, dwSize, typ, PAGE_EXECUTE_READWRITE);
     } else {
         const PROT_READ: i32 = 0x1;
         const PROT_WRITE: i32 = 0x2;
@@ -41,13 +53,9 @@ fn shim_XMemVirtualAlloc(
     flAllocationType: u32,
     flProtect: u32,
 ) callconv(.{ .x86_64_win = .{} }) ?*anyopaque {
-    _ = flAllocationType;
-    _ = flProtect;
-    const ptr = hostAlloc(lpAddress, dwSize);
-    std.log.info("[XMEM] XMemVirtualAlloc(addr=0x{x}, size=0x{x}) -> 0x{x}", .{
-        @intFromPtr(lpAddress),
-                 dwSize,
-                 @intFromPtr(ptr),
+    const ptr = hostAlloc(lpAddress, dwSize, flAllocationType, flProtect);
+    std.log.info("[XMEM] XMemVirtualAlloc(addr=0x{x}, size=0x{x}, type=0x{x}, prot=0x{x}) -> 0x{x}", .{
+        @intFromPtr(lpAddress), dwSize, flAllocationType, flProtect, @intFromPtr(ptr),
     });
     return ptr;
 }
@@ -55,7 +63,7 @@ fn shim_XMemVirtualAlloc(
 fn shim_XMemAlloc(dwSize: usize, dwAllocAttributes: u64) callconv(.{ .x86_64_win = .{} }) ?*anyopaque {
     _ = dwAllocAttributes;
     const aligned_size = std.mem.alignForward(usize, @max(dwSize, 4096), 4096);
-    const ptr = hostAlloc(null, aligned_size);
+    const ptr = hostAlloc(null, aligned_size, 0x3000, 0x04);
     std.log.info("[XMEM] XMemAlloc(size=0x{x}) -> 0x{x}", .{ dwSize, @intFromPtr(ptr) });
     return ptr;
 }
@@ -89,7 +97,7 @@ fn shim_XMemMapPhysicalPages(
 ) callconv(.{ .x86_64_win = .{} }) ?*anyopaque {
     _ = flProtect;
     const total_bytes = numberOfPages * pageSize;
-    const dst_ptr = hostAlloc(virtualAddress, total_bytes) orelse return null;
+    const dst_ptr = hostAlloc(virtualAddress, total_bytes, 0x3000, 0x04) orelse return null;
     const dst_bytes: [*]u8 = @ptrCast(dst_ptr);
 
     var i: usize = 0;

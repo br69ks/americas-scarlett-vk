@@ -246,8 +246,7 @@ def generate_zig_files(
 
             lines.extend([
                 f"pub fn {zig_fn}() callconv(.{{ .x86_64_win = .{{}} }}) usize {{",
-                f'    std.log.warn("[STUB] {{s}}!{{s}} (ord={{s}})", .{{ {dll_literal}, {name_literal}, {zig_string_literal(ordinal_text)} }});',
-                "    return 0;",
+                f'    return @import("../stub_policy.zig").missing({dll_literal}, {name_literal});',
                 "}",
                 "",
             ])

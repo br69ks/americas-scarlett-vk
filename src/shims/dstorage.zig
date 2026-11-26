@@ -1,8 +1,6 @@
 const std = @import("std");
 const win32_fs = @import("win32_fs.zig");
 
-var g_req_logs = std.atomic.Value(u32).init(0);
-
 const c_stdio = struct {
     extern "c" fn fseek(stream: *std.c.FILE, offset: c_long, whence: c_int) c_int;
     extern "c" fn ftell(stream: *std.c.FILE) c_long;
@@ -12,8 +10,11 @@ pub const IDStorageFileVtbl = extern struct {
     QueryInterface: *const fn (*IDStorageFile, ?*const anyopaque, *?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32,
     AddRef: *const fn (*IDStorageFile) callconv(.{ .x86_64_win = .{} }) u32,
     Release: *const fn (*IDStorageFile) callconv(.{ .x86_64_win = .{} }) u32,
+    GetFileSize: *const fn (*IDStorageFile, *u64) callconv(.{ .x86_64_win = .{} }) i32,
     Close: *const fn (*IDStorageFile) callconv(.{ .x86_64_win = .{} }) void,
-    GetFileInformation: *const fn (*IDStorageFile, ?[*]u8) callconv(.{ .x86_64_win = .{} }) i32,
+    Reserved5: *const fn (*IDStorageFile) callconv(.{ .x86_64_win = .{} }) i32,
+    Reserved6: *const fn (*IDStorageFile) callconv(.{ .x86_64_win = .{} }) i32,
+    Reserved7: *const fn (*IDStorageFile) callconv(.{ .x86_64_win = .{} }) i32,
 };
 
 pub const IDStorageFile = extern struct {
@@ -32,28 +33,32 @@ fn file_AddRef(_: *IDStorageFile) callconv(.{ .x86_64_win = .{} }) u32 {
 fn file_Release(_: *IDStorageFile) callconv(.{ .x86_64_win = .{} }) u32 {
     return 1;
 }
+fn file_GetFileSize(self: *IDStorageFile, size_out: *u64) callconv(.{ .x86_64_win = .{} }) i32 {
+    size_out.* = self.size;
+    std.log.info("[DSTORAGE] GetFileSize(0x{x}) -> {d}", .{ @intFromPtr(self), self.size });
+    return 0;
+}
+fn file_Reserved(_: *IDStorageFile) callconv(.{ .x86_64_win = .{} }) i32 {
+    return -2147467263; // E_NOTIMPL
+}
+
 fn file_Close(self: *IDStorageFile) callconv(.{ .x86_64_win = .{} }) void {
+    std.log.info("[DSTORAGE] CloseFile(0x{x})", .{@intFromPtr(self)});
     if (self.fp) |f| {
         _ = std.c.fclose(f);
         self.fp = null;
     }
-}
-fn file_GetFileInformation(self: *IDStorageFile, info_out: ?[*]u8) callconv(.{ .x86_64_win = .{} }) i32 {
-    if (info_out) |out| {
-        @memset(out[0..52], 0);
-        std.mem.writeInt(u32, out[0..4], 0x80, .little);
-        std.mem.writeInt(u32, out[32..36], @truncate(self.size >> 32), .little);
-        std.mem.writeInt(u32, out[36..40], @truncate(self.size & 0xFFFFFFFF), .little);
-    }
-    return 0;
 }
 
 const g_dstorage_file_vtbl = IDStorageFileVtbl{
     .QueryInterface = &file_QueryInterface,
     .AddRef = &file_AddRef,
     .Release = &file_Release,
+    .GetFileSize = &file_GetFileSize,
     .Close = &file_Close,
-    .GetFileInformation = &file_GetFileInformation,
+    .Reserved5 = &file_Reserved,
+    .Reserved6 = &file_Reserved,
+    .Reserved7 = &file_Reserved,
 };
 
 pub const IDStorageStatusArrayVtbl = extern struct {
@@ -126,8 +131,21 @@ fn q_AddRef(_: *IDStorageQueue) callconv(.{ .x86_64_win = .{} }) u32 {
 fn q_Release(_: *IDStorageQueue) callconv(.{ .x86_64_win = .{} }) u32 {
     return 1;
 }
+var g_ds_logs = std.atomic.Value(u32).init(0);
+
 fn q_EnqueueRequest(_: *IDStorageQueue, req_ptr: ?[*]const u8) callconv(.{ .x86_64_win = .{} }) void {
     const req = req_ptr orelse return;
+    if (g_ds_logs.fetchAdd(1, .monotonic) < 32) {
+        std.log.info("[DSTORAGE] EnqueueRequest raw: 00={x} 08={x} 10={x} 18={x} 20={x} 28={x} 30={x}", .{
+            std.mem.readInt(u64, req[0..8], .little),
+            std.mem.readInt(u64, req[8..16], .little),
+            std.mem.readInt(u64, req[16..24], .little),
+            std.mem.readInt(u64, req[24..32], .little),
+            std.mem.readInt(u64, req[32..40], .little),
+            std.mem.readInt(u64, req[40..48], .little),
+            std.mem.readInt(u64, req[48..56], .little),
+        });
+    }
     // DSTORAGE_REQUEST layout (x64):
     //   0x00 QueueType (u32)
     //   0x08 Options (u64)
@@ -140,16 +158,7 @@ fn q_EnqueueRequest(_: *IDStorageQueue, req_ptr: ?[*]const u8) callconv(.{ .x86_
     const dst_offset = std.mem.readInt(u32, req[0x28..0x2C], .little);
     const dst_size = std.mem.readInt(u32, req[0x2C..0x30], .little);
     if (dst_addr == 0 or dst_size == 0) return;
-    const req_log = g_req_logs.fetchAdd(1, .monotonic);
-    if (req_log < 16) {
-        std.log.info("[DSTORAGE] request src_type={d} dst=0x{x}+0x{x} size=0x{x} src=0x{x} src_off=0x{x}", .{
-            source_type, dst_addr, dst_offset, dst_size,
-            std.mem.readInt(usize, req[0x10..0x18], .little),
-            std.mem.readInt(u32, req[0x18..0x1C], .little),
-        });
-    }
     const dst: [*]u8 = @ptrFromInt(dst_addr + dst_offset);
-
     if (source_type == 0) {
         const src_addr = std.mem.readInt(usize, req[0x10..0x18], .little);
         const src_size = std.mem.readInt(u32, req[0x1C..0x20], .little);
@@ -173,10 +182,19 @@ fn q_EnqueueRequest(_: *IDStorageQueue, req_ptr: ?[*]const u8) callconv(.{ .x86_
     }
 }
 
-
-fn q_EnqueueStatus(_: *IDStorageQueue, _: ?*anyopaque, _: u32) callconv(.{ .x86_64_win = .{} }) void {}
-fn q_EnqueueSignal(_: *IDStorageQueue, _: ?*anyopaque, _: u64) callconv(.{ .x86_64_win = .{} }) void {}
-fn q_Submit(_: *IDStorageQueue) callconv(.{ .x86_64_win = .{} }) void {}
+fn q_EnqueueStatus(_: *IDStorageQueue, status: ?*anyopaque, index: u32) callconv(.{ .x86_64_win = .{} }) void {
+    if (g_ds_logs.fetchAdd(1, .monotonic) < 32) {
+        std.log.info("[DSTORAGE] EnqueueStatus status=0x{x} index={d}", .{ @intFromPtr(status), index });
+    }
+}
+fn q_EnqueueSignal(_: *IDStorageQueue, fence: ?*anyopaque, value: u64) callconv(.{ .x86_64_win = .{} }) void {
+    if (g_ds_logs.fetchAdd(1, .monotonic) < 32) {
+        std.log.info("[DSTORAGE] EnqueueSignal fence=0x{x} value={d}", .{ @intFromPtr(fence), value });
+    }
+}
+fn q_Submit(_: *IDStorageQueue) callconv(.{ .x86_64_win = .{} }) void {
+    if (g_ds_logs.fetchAdd(1, .monotonic) < 32) std.log.info("[DSTORAGE] Submit", .{});
+}
 fn q_CancelRequestsWithTag(_: *IDStorageQueue, _: u64, _: u64) callconv(.{ .x86_64_win = .{} }) void {}
 fn q_Close(_: *IDStorageQueue) callconv(.{ .x86_64_win = .{} }) void {}
 fn q_GetErrorEvent(_: *IDStorageQueue) callconv(.{ .x86_64_win = .{} }) usize {
@@ -221,11 +239,16 @@ pub const IDStorageFactoryVtbl = extern struct {
     CreateQueueLegacy: *const fn (*IDStorageFactory, ?*const anyopaque, ?*const anyopaque, *?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32,
     OpenFile: *const fn (*IDStorageFactory, ?[*:0]const u16, ?*const anyopaque, *?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32,
     CreateStatusArray: *const fn (*IDStorageFactory, u32, ?[*:0]const u8, ?*const anyopaque, *?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32,
-    SetDebugFlags: *const fn (*IDStorageFactory, u32) callconv(.{ .x86_64_win = .{} }) void,
     SetCpuAffinity: *const fn (*IDStorageFactory, u64) callconv(.{ .x86_64_win = .{} }) i32,
+    SetDebugFlags: *const fn (*IDStorageFactory, u32) callconv(.{ .x86_64_win = .{} }) void,
     SetStagingBufferSize: *const fn (*IDStorageFactory, u32) callconv(.{ .x86_64_win = .{} }) i32,
     ReservedSlot9: *const fn (*IDStorageFactory) callconv(.{ .x86_64_win = .{} }) i32,
     CreateQueue: *const fn (*IDStorageFactory, ?*const anyopaque, ?*const anyopaque, *?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32,
+    ReservedSlot11: *const fn (*IDStorageFactory) callconv(.{ .x86_64_win = .{} }) i32,
+    ReservedSlot12: *const fn (*IDStorageFactory) callconv(.{ .x86_64_win = .{} }) i32,
+    ReservedSlot13: *const fn (*IDStorageFactory) callconv(.{ .x86_64_win = .{} }) i32,
+    ReservedSlot14: *const fn (*IDStorageFactory) callconv(.{ .x86_64_win = .{} }) i32,
+    ReservedSlot15: *const fn (*IDStorageFactory) callconv(.{ .x86_64_win = .{} }) i32,
 };
 
 pub const IDStorageFactory = extern struct {
@@ -289,7 +312,7 @@ fn f_OpenFile(_: *IDStorageFactory, path: ?[*:0]const u16, _: ?*const anyopaque,
         .size = if (sz_pos > 0) @intCast(sz_pos) else 0,
     };
 
-    std.log.info("[DSTORAGE] OpenFile(\"{s}\", size={d}) -> S_OK (0x{x})", .{ written, obj.size, @intFromPtr(obj) });
+    std.log.info("[DSTORAGE] OpenFile(raw=\"{s}\", host=\"{s}\", size={d}) -> S_OK (0x{x})", .{ raw_storage[0..raw_len], written, obj.size, @intFromPtr(obj) });
     ppv.* = obj;
     return 0;
 }
@@ -318,6 +341,10 @@ fn f_CreateQueue(_: *IDStorageFactory, _: ?*const anyopaque, _: ?*const anyopaqu
     return 0;
 }
 
+fn f_ReservedFactory(_: *IDStorageFactory) callconv(.{ .x86_64_win = .{} }) i32 {
+    return -2147467263; // E_NOTIMPL
+}
+
 const g_dstorage_factory_vtbl = IDStorageFactoryVtbl{
     .QueryInterface = &f_QueryInterface,
     .AddRef = &f_AddRef,
@@ -325,11 +352,16 @@ const g_dstorage_factory_vtbl = IDStorageFactoryVtbl{
     .CreateQueueLegacy = &f_CreateQueue,
     .OpenFile = &f_OpenFile,
     .CreateStatusArray = &f_CreateStatusArray,
-    .SetDebugFlags = &f_SetDebugFlags,
     .SetCpuAffinity = &f_SetCpuAffinity,
+    .SetDebugFlags = &f_SetDebugFlags,
     .SetStagingBufferSize = &f_SetStagingBufferSize,
     .ReservedSlot9 = &f_ReservedSlot9,
     .CreateQueue = &f_CreateQueue,
+    .ReservedSlot11 = &f_ReservedFactory,
+    .ReservedSlot12 = &f_ReservedFactory,
+    .ReservedSlot13 = &f_ReservedFactory,
+    .ReservedSlot14 = &f_ReservedFactory,
+    .ReservedSlot15 = &f_ReservedFactory,
 };
 
 var g_dstorage_factory_instance = IDStorageFactory{

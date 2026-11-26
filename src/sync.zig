@@ -794,3 +794,51 @@ pub fn wakeByAddressSingle(addr: *const anyopaque) void {
 pub fn wakeByAddressAll(addr: *const anyopaque) void {
     futexWake(@ptrCast(@alignCast(addr)), std.math.maxInt(u32));
 }
+
+test "auto-reset event wakes once" {
+    const handle = createEventW(false, false);
+    try std.testing.expect(handle != 0);
+    defer _ = closeHandle(handle);
+
+    try std.testing.expectEqual(WAIT_TIMEOUT, waitForSingleObject(handle, 0));
+    try std.testing.expect(setEvent(handle));
+    try std.testing.expectEqual(WAIT_OBJECT_0, waitForSingleObject(handle, 0));
+    try std.testing.expectEqual(WAIT_TIMEOUT, waitForSingleObject(handle, 0));
+}
+
+test "manual-reset event stays signaled" {
+    const handle = createEventW(true, true);
+    try std.testing.expect(handle != 0);
+    defer _ = closeHandle(handle);
+
+    try std.testing.expectEqual(WAIT_OBJECT_0, waitForSingleObject(handle, 0));
+    try std.testing.expectEqual(WAIT_OBJECT_0, waitForSingleObject(handle, 0));
+    try std.testing.expect(resetEvent(handle));
+    try std.testing.expectEqual(WAIT_TIMEOUT, waitForSingleObject(handle, 0));
+}
+
+test "semaphore counts down and releases" {
+    const handle = createSemaphoreW(1, 2);
+    try std.testing.expect(handle != 0);
+    defer _ = closeHandle(handle);
+
+    try std.testing.expectEqual(WAIT_OBJECT_0, waitForSingleObject(handle, 0));
+    try std.testing.expectEqual(WAIT_TIMEOUT, waitForSingleObject(handle, 0));
+    var previous: u32 = 0;
+    try std.testing.expect(releaseSemaphore(handle, 1, &previous));
+    try std.testing.expectEqual(@as(u32, 0), previous);
+    try std.testing.expectEqual(WAIT_OBJECT_0, waitForSingleObject(handle, 0));
+}
+
+test "recursive mutex" {
+    const handle = createMutexW(true);
+    try std.testing.expect(handle != 0);
+    defer _ = closeHandle(handle);
+
+    // Initial owner plus one recursive acquire.
+    try std.testing.expectEqual(WAIT_OBJECT_0, waitForSingleObject(handle, 0));
+    try std.testing.expect(releaseMutex(handle));
+    try std.testing.expect(releaseMutex(handle));
+    try std.testing.expectEqual(WAIT_OBJECT_0, waitForSingleObject(handle, 0));
+    try std.testing.expect(releaseMutex(handle));
+}

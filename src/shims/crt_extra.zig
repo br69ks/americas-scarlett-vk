@@ -58,12 +58,15 @@ const Context = extern struct {
     r14: u64 = 0,
     r15: u64 = 0,
     rip: u64 = 0,
+    _pad_xmm: [0x300 - 0x100]u8 = @splat(0),
+    xmm: [16][16]u8 = @splat(@splat(0)),
 };
 
 comptime {
     std.debug.assert(@offsetOf(Context, "context_flags") == 0x30);
     std.debug.assert(@offsetOf(Context, "rax") == 0x78);
     std.debug.assert(@offsetOf(Context, "rip") == 0xF8);
+    std.debug.assert(@offsetOf(Context, "xmm") == 0x300);
 }
 
 /// Naked on purpose: the guest calls this with RCX = CONTEXT*.  It must not
@@ -117,23 +120,190 @@ fn shim_RtlPcToFileHeader(pc: u64, image_base_out: ?*u64) callconv(win) u64 {
     return m.base;
 }
 
+const UnwindOp = struct {
+    kind: u8,
+    info: u8,
+    operand: u64,
+};
+
+fn readU16(p: [*]const u8, off: usize) u16 {
+    return std.mem.readInt(u16, p[off..][0..2], .little);
+}
+
+fn readU32(p: [*]const u8, off: usize) u32 {
+    return std.mem.readInt(u32, p[off..][0..4], .little);
+}
+
+fn readU64(p: [*]const u8, off: usize) u64 {
+    return std.mem.readInt(u64, p[off..][0..8], .little);
+}
+
+fn regField(ctx: *Context, reg: u8) *u64 {
+    return switch (reg) {
+        0 => &ctx.rax,
+        1 => &ctx.rcx,
+        2 => &ctx.rdx,
+        3 => &ctx.rbx,
+        4 => &ctx.rsp,
+        5 => &ctx.rbp,
+        6 => &ctx.rsi,
+        7 => &ctx.rdi,
+        8 => &ctx.r8,
+        9 => &ctx.r9,
+        10 => &ctx.r10,
+        11 => &ctx.r11,
+        12 => &ctx.r12,
+        13 => &ctx.r13,
+        14 => &ctx.r14,
+        15 => &ctx.r15,
+        else => &ctx.rsp,
+    };
+}
+
+fn applyUnwindOp(ctx: *Context, op: UnwindOp) void {
+    const stack: [*]const u8 = @ptrFromInt(@as(usize, @intCast(ctx.rsp)));
+    switch (op.kind) {
+        0 => { // PUSH_NONVOL
+            regField(ctx, op.info).* = readU64(stack, 0);
+            ctx.rsp += 8;
+        },
+        1 => { // ALLOC_LARGE
+            ctx.rsp += op.operand;
+        },
+        2 => { // ALLOC_SMALL
+            ctx.rsp += @as(u64, op.info) * 8 + 8;
+        },
+        3 => {}, // SET_FPREG, handled by the caller
+        4 => { // SAVE_NONVOL
+            regField(ctx, op.info).* = readU64(stack, @intCast(op.operand));
+        },
+        5 => { // SAVE_NONVOL_FAR
+            regField(ctx, op.info).* = readU64(stack, @intCast(op.operand));
+        },
+        8 => { // SAVE_XMM128
+            const off: usize = @intCast(op.operand);
+            @memcpy(ctx.xmm[op.info][0..16], stack[off..][0..16]);
+        },
+        9 => { // SAVE_XMM128_FAR
+            const off: usize = @intCast(op.operand);
+            @memcpy(ctx.xmm[op.info][0..16], stack[off..][0..16]);
+        },
+        10 => { // PUSH_MACHFRAME
+            if (op.info != 0) ctx.rsp += 8; // error code
+            ctx.rip = readU64(stack, 8);
+            ctx.rsp += 8 + 32; // RIP, CS, EFLAGS, RSP, SS
+        },
+        else => {},
+    }
+}
+
 fn shim_RtlVirtualUnwind(
     _: u32,
-    _: u64,
-    _: u64,
-    _: ?*const module.RuntimeFunction,
-    context: ?*anyopaque,
-    _: ?*?*anyopaque,
+    image_base: u64,
+    control_pc: u64,
+    function_entry: ?*const module.RuntimeFunction,
+    context_record: ?*anyopaque,
+    handler_data: ?*?*anyopaque,
     establisher: ?*u64,
     _: ?*anyopaque,
 ) callconv(win) ?*anyopaque {
-    if (establisher) |out| {
-        if (context) |ctx| {
-            const c: *Context = @ptrCast(@alignCast(ctx));
-            out.* = c.rsp;
-        } else {
-            out.* = 0;
+    const fe = function_entry orelse return null;
+    const ctx: *Context = @ptrCast(@alignCast(context_record orelse return null));
+    const info: [*]const u8 = @ptrFromInt(@as(usize, @intCast(image_base + fe.unwind)));
+
+    const version_flags = info[0];
+    if (builtin.os.tag == .linux) {
+        std.log.err("[UNW] img=0x{x} pc=0x{x} rva=0x{x} fe=0x{x} begin=0x{x} end=0x{x} unwind=0x{x} info={x:0>2}{x:0>2}{x:0>2}{x:0>2} rsp=0x{x}", .{
+            image_base, control_pc, control_pc - image_base, @intFromPtr(fe), fe.begin, fe.end, fe.unwind, info[0], info[1], info[2], info[3], ctx.rsp,
+        });
+    }
+    if (version_flags & 0x7 != 1) return null;
+    const flags = version_flags >> 3;
+    const count: usize = info[2];
+    const frame_reg: u8 = info[3] & 0xF;
+    const frame_offset: u8 = info[3] >> 4;
+
+    const alloc = std.heap.c_allocator;
+    const ops = alloc.alloc(UnwindOp, 256) catch return null;
+    defer alloc.free(ops);
+    var op_count: usize = 0;
+    var idx: usize = 0;
+    while (idx < count and idx < 255) {
+        const code_off = idx * 2;
+        const b0 = info[4 + code_off];
+        const b1 = info[4 + code_off + 1];
+        const kind = b1 & 0xF;
+        const op_info = b1 >> 4;
+        var operand: u64 = 0;
+        var slots: usize = 1;
+
+        switch (kind) {
+            1 => { // ALLOC_LARGE
+                if (op_info == 0) {
+                    operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) * 8;
+                    slots = 2;
+                } else {
+                    operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) |
+                        (@as(u64, readU16(info, 4 + (idx + 2) * 2)) << 16);
+                    slots = 3;
+                }
+            },
+            2 => operand = @as(u64, op_info) * 8 + 8,
+            4 => {
+                operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) * 8;
+                slots = 2;
+            },
+            5 => {
+                operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) |
+                    (@as(u64, readU16(info, 4 + (idx + 2) * 2)) << 16);
+                slots = 3;
+            },
+            8 => { // SAVE_XMM128
+                operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) * 16;
+                slots = 2;
+            },
+            9 => { // SAVE_XMM128_FAR
+                operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) |
+                    (@as(u64, readU16(info, 4 + (idx + 2) * 2)) << 16);
+                slots = 3;
+            },
+            else => {},
         }
+
+        if (builtin.os.tag == .linux and op_count < 12) {
+            std.log.err("[UNWOP] {d}: kind={d} info={d} operand=0x{x}", .{ op_count, kind, op_info, operand });
+        }
+        ops[op_count] = .{ .kind = kind, .info = op_info, .operand = operand };
+        op_count += 1;
+        idx += slots;
+        _ = b0;
+    }
+
+    // Unwind codes are stored in descending prolog-offset order; applying them
+    // in that order undoes the prolog.
+    var i: usize = 0;
+    while (i < op_count) : (i += 1) {
+        if (ops[i].kind == 3) {
+            if (frame_reg != 0) {
+                ctx.rsp = regField(ctx, frame_reg).* - @as(u64, frame_offset) * 16;
+            }
+            continue;
+        }
+        applyUnwindOp(ctx, ops[i]);
+    }
+
+    if (establisher) |out| out.* = ctx.rsp;
+
+    // Pop the return address.
+    const stack: [*]const u8 = @ptrFromInt(@as(usize, @intCast(ctx.rsp)));
+    ctx.rip = readU64(stack, 0);
+    ctx.rsp += 8;
+
+    if (flags & 0x3 != 0) {
+        const handler_off = std.mem.alignForward(usize, 4 + count * 2, 4);
+        const handler_rva = readU32(info, handler_off);
+        if (handler_data) |out| out.* = @ptrFromInt(@as(usize, @intCast(image_base + handler_off + 4)));
+        return @ptrFromInt(@as(usize, @intCast(image_base + handler_rva)));
     }
     return null;
 }
@@ -901,4 +1071,79 @@ pub fn resolve(sym_name: []const u8) ?usize {
         if (std.mem.eql(u8, entry.@"0", sym_name)) return entry.@"1";
     }
     return null;
+}
+
+test "RtlVirtualUnwind undoes a small stack allocation" {
+    var image: [0x200]u8 = @splat(0);
+    const image_base = @intFromPtr(&image);
+
+    // UNWIND_INFO at RVA 0x100: version 1, one UWOP_ALLOC_SMALL(3) at prolog 4.
+    image[0x100] = 0x01; // version 1, flags 0
+    image[0x101] = 0x04; // SizeOfProlog
+    image[0x102] = 0x01; // CountOfCodes
+    image[0x103] = 0x00; // FrameRegister/Offset
+    image[0x104] = 0x04; // code offset
+    image[0x105] = 0x23; // UWOP_ALLOC_SMALL, op_info 3 => 0x20 bytes
+
+    var stack: [0x200]u8 align(16) = @splat(0);
+    const entry_rsp = @intFromPtr(&stack) + 0x100;
+    const return_addr: u64 = 0x140001234;
+    std.mem.writeInt(u64, stack[0x100..][0..8], return_addr, .little);
+
+    var ctx = Context{};
+    ctx.rsp = entry_rsp - 0x20;
+
+    const fe = module.RuntimeFunction{ .begin = 0x1000, .end = 0x2000, .unwind = 0x100 };
+    var handler_data: ?*anyopaque = null;
+    var establisher: u64 = 0;
+    const handler = shim_RtlVirtualUnwind(
+        0,
+        image_base,
+        image_base + 0x1000,
+        &fe,
+        &ctx,
+        &handler_data,
+        &establisher,
+        null,
+    );
+
+    try std.testing.expect(handler == null);
+    try std.testing.expectEqual(@as(u64, entry_rsp), establisher);
+    try std.testing.expectEqual(return_addr, ctx.rip);
+    try std.testing.expectEqual(@as(u64, entry_rsp + 8), ctx.rsp);
+}
+
+test "RtlVirtualUnwind reports the exception handler" {
+    var image: [0x200]u8 = @splat(0);
+    const image_base = @intFromPtr(&image);
+
+    image[0x100] = 0x09; // version 1, UNW_FLAG_EHANDLER (0x1 << 3)
+    image[0x101] = 0x00;
+    image[0x102] = 0x00;
+    image[0x103] = 0x00;
+    std.mem.writeInt(u32, image[0x104..][0..4], 0x80, .little); // handler RVA
+
+    var stack: [0x100]u8 align(16) = @splat(0);
+    const rsp = @intFromPtr(&stack) + 0x80;
+    std.mem.writeInt(u64, stack[0x80..][0..8], 0x140005678, .little);
+
+    var ctx = Context{};
+    ctx.rsp = rsp;
+    const fe = module.RuntimeFunction{ .begin = 0x1000, .end = 0x2000, .unwind = 0x100 };
+    var handler_data: ?*anyopaque = null;
+    var establisher: u64 = 0;
+    const handler = shim_RtlVirtualUnwind(
+        0,
+        image_base,
+        image_base + 0x1000,
+        &fe,
+        &ctx,
+        &handler_data,
+        &establisher,
+        null,
+    );
+
+    try std.testing.expect(handler != null);
+    try std.testing.expectEqual(image_base + 0x80, @intFromPtr(handler.?));
+    try std.testing.expectEqual(image_base + 0x108, @intFromPtr(handler_data.?));
 }

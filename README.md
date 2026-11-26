@@ -4,7 +4,7 @@ Experimental cross-platform (Linux/Windows) x86-64 compatibility loader and Vulk
 
 ## Quick Start
 
-1. **Generate IAT logging stubs from an import dump:**
+1. **Generate IAT fallback stubs from an import dump:**
    ```bash
    python3 tools/gen_stubs.py imports.txt src/shims/generated
    ```
@@ -23,6 +23,16 @@ Experimental cross-platform (Linux/Windows) x86-64 compatibility loader and Vulk
    ```bash
    ./zig-out/bin/americas-loader /path/to/game_scarlett_master.exe
    ```
+
+5. **Run tests:**
+   ```bash
+   zig build test
+   python3 -m unittest discover -s tools -p 'test_*.py' -v
+   ```
+
+Generated stubs fail closed: an unimplemented API aborts with `[STUB] ...`.
+Set `SCARLETT_STUB_POLICY=zero` to restore the old zero-return behaviour when
+debugging a specific path.
 
 ## Project Roadmap
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the milestone checklist and runtime loading pipeline.

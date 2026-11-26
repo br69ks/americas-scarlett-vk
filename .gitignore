@@ -25,3 +25,7 @@ run_log*.txt
 src/shims/generated/
 
 ref/
+
+# Python test caches
+__pycache__/
+*.pyc

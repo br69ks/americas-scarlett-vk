@@ -124,6 +124,24 @@ fn dumpContext(buf: []u8, ctx: *const UContext) void {
             writeFmt(buf, "  [rsp+0x{x}] = 0x{x}\n", .{ i * 8, value });
         }
     }
+
+    // Best-effort ASCII runs on the current stack.  The failing guest path is
+    // usually built into a stack buffer immediately before the assert.
+    const bytes: [*]const u8 = @ptrFromInt(rsp);
+    var start: ?usize = null;
+    var j: usize = 0;
+    while (j < 1024) : (j += 1) {
+        const c = bytes[j];
+        const printable = c >= 0x20 and c < 0x7f;
+        if (printable) {
+            if (start == null) start = j;
+        } else if (start) |s| {
+            if (j - s >= 4) {
+                writeFmt(buf, "  str[rsp+0x{x}]: {s}\n", .{ s, bytes[s..@min(j, s + 120)] });
+            }
+            start = null;
+        }
+    }
 }
 
 fn handler(sig: linux.SIG, info: *const linux.siginfo_t, uctx: ?*anyopaque) callconv(.c) void {

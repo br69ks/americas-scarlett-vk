@@ -18,6 +18,9 @@ const sync_shims = @import("shims/sync_shims.zig");
 const game_input = @import("shims/game_input.zig");
 const registry = @import("shims/generated/registry.zig");
 const crt_extra = @import("shims/crt_extra.zig");
+const wsa = @import("shims/wsa.zig");
+const host_imports = @import("host_imports.zig");
+const host_tls = @import("host_tls.zig");
 
 const Allocator = std.mem.Allocator;
 const DllMainFn = *const fn (usize, u32, ?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32;
@@ -35,8 +38,28 @@ const Ctx = struct {
 var g_allocator: ?Allocator = null;
 var g_io: ?std.Io = null;
 var g_dirs: []const []const u8 = &.{};
+var g_arena: ?pe_loader.TrampolineArena = null;
+
+fn arenaPtr() ?*pe_loader.TrampolineArena {
+    if (g_arena) |*a| return a;
+    return null;
+}
+
+pub fn wrapGuestFunction(ptr: usize) ?usize {
+    if (builtin.os.tag != .windows or module.findByAddress(ptr) != null) return null;
+    const a = arenaPtr() orelse return null;
+    return a.emitThunk(ptr) catch null;
+}
+
+pub fn refreshGuestTls() void {
+    if (builtin.os.tag != .windows) return;
+    for (module.all()) |m| {
+        if (m.tls_index != 0 and m.tls_block != 0) teb.setModuleTlsCurrent(@intCast(m.tls_index), m.tls_block, m.tls_block_size);
+    }
+}
 
 pub fn init(allocator: Allocator, io: std.Io, dirs: []const []const u8) void {
+    host_imports.g_game_dir = if (dirs.len > 0) dirs[0] else "";
     g_allocator = allocator;
     g_io = io;
     g_dirs = dirs;
@@ -46,6 +69,8 @@ pub fn init(allocator: Allocator, io: std.Io, dirs: []const []const u8) void {
     module.free_library_fn = &freeLibrary;
     module.thread_attach_fn = &threadAttach;
     module.thread_detach_fn = &threadDetach;
+    g_arena = pe_loader.TrampolineArena.init(1024 * 1024) catch null;
+    crt_core.wrap_guest_fn = &wrapGuestFunction;
     module.resolve_shim_fn = &resolveShimByName;
 }
 
@@ -54,7 +79,7 @@ pub const LoadedExe = struct {
     mod: *module.Module,
 };
 
-pub fn loadExecutable(allocator: Allocator, io: std.Io, path: []const u8) !LoadedExe {
+pub fn loadExecutable(allocator: Allocator, io: std.Io, path: []const u8, display_path: []const u8) !LoadedExe {
     var ctx = Ctx{ .allocator = allocator, .io = io };
     var image = try pe_loader.mapImage(allocator, io, path);
     errdefer image.deinit();
@@ -62,8 +87,8 @@ pub fn loadExecutable(allocator: Allocator, io: std.Io, path: []const u8) !Loade
     const exports = try loadExports(allocator, &image);
     const m = try module.register(
         allocator,
-        path,
-        std.fs.path.basename(path),
+        display_path,
+        std.fs.path.basename(display_path),
         image.base_addr,
         image.image_size,
         image.entry_point,
@@ -72,17 +97,18 @@ pub fn loadExecutable(allocator: Allocator, io: std.Io, path: []const u8) !Loade
         exports,
         true,
     );
-
-    setupTls(&image, m) catch |err| {
-        std.log.err("TLS setup failed for {s}: {s}", .{ path, @errorName(err) });
-    };
+    m.host_mode = isHostModeDll(std.fs.path.basename(path));
 
     _ = try pe_loader.patchImports(&image, .{
         .ctx = @ptrCast(&ctx),
         .resolve = &resolveImport,
-        .arena = null,
+        .arena = arenaPtr(),
         .allocator = allocator,
     });
+
+    setupTls(&image, m) catch |err| {
+        std.log.err("TLS setup failed for {s}: {s}", .{ path, @errorName(err) });
+    };
 
     runTlsCallbacks(m, DLL_PROCESS_ATTACH);
     return .{ .image = image, .mod = m };
@@ -100,9 +126,10 @@ fn loadExports(allocator: Allocator, image: *const pe_loader.MappedImage) ![]mod
 
 fn setupTls(image: *const pe_loader.MappedImage, m: *module.Module) !void {
     m.tls_block = image.tls_block_addr;
+    m.tls_block_size = image.tls_block_size;
     m.tls_callbacks = image.tls_callbacks;
     if (image.tls_block_addr == 0) return;
-    const index = try teb.allocModuleTls(image.tls_block_addr);
+    const index = try teb.allocModuleTls(image.tls_block_addr, image.tls_block_size);
     m.tls_index = index;
     if (image.tls_index_va != 0) {
         const idx_ptr: *u32 = @ptrFromInt(image.tls_index_va);
@@ -113,6 +140,10 @@ fn setupTls(image: *const pe_loader.MappedImage, m: *module.Module) !void {
 fn runTlsCallbacks(m: *module.Module, reason: u32) void {
     if (m.tls_callbacks == 0) return;
     const callbacks: [*]const usize = @ptrFromInt(m.tls_callbacks);
+    if (!m.host_mode) {
+        teb.enterGuest();
+        defer teb.leaveGuest();
+    }
     var i: usize = 0;
     while (callbacks[i] != 0) : (i += 1) {
         if (i > 256) break;
@@ -121,9 +152,27 @@ fn runTlsCallbacks(m: *module.Module, reason: u32) void {
     }
 }
 
+
+pub fn runThreadTlsCallbacks() void {
+    for (module.all()) |m| {
+        if (m.tls_callbacks == 0) continue;
+        const callbacks: [*]const usize = @ptrFromInt(m.tls_callbacks);
+        var i: usize = 0;
+        while (callbacks[i] != 0) : (i += 1) {
+            if (i > 256) break;
+            const f: DllMainFn = @ptrFromInt(callbacks[i]);
+            _ = f(m.base, 2, null); // DLL_THREAD_ATTACH
+        }
+    }
+}
+
 fn callDllMain(m: *module.Module, reason: u32) void {
     if (m.entry == 0 or m.is_exe) return;
     const f: DllMainFn = @ptrFromInt(m.entry);
+    if (!m.host_mode) {
+        teb.enterGuest();
+        defer teb.leaveGuest();
+    }
     _ = f(m.base, reason, null);
 }
 
@@ -145,10 +194,12 @@ fn threadDetach() void {
 }
 
 fn shimResolve(dll: []const u8, name: ?[]const u8, ordinal: ?u16) ?usize {
+    if (host_imports.resolve(dll, name, ordinal)) |ptr| return ptr;
     if (ordinal) |ord| {
         if (std.ascii.eqlIgnoreCase(dll, "gameinput.dll") and ord == 1) {
             return @intFromPtr(&game_input.shim_GameInputCreate);
         }
+        if (wsa.resolveOrdinal(dll, ord)) |ptr| return ptr;
         return registry.resolve(dll, null, ord);
     }
     const n = name orelse return null;
@@ -158,6 +209,7 @@ fn shimResolve(dll: []const u8, name: ?[]const u8, ordinal: ?u16) ?usize {
     if (xmem.resolve(n)) |ptr| return ptr;
     if (dstorage.resolve(n)) |ptr| return ptr;
     if (win32_fs.resolve(n)) |ptr| return ptr;
+    if (wsa.resolve(n)) |ptr| return ptr;
     return registry.resolve(dll, n, null);
 }
 
@@ -225,7 +277,35 @@ fn findDllPath(allocator: Allocator, dll: []const u8) ?[]u8 {
     return null;
 }
 
+fn isHostModeDll(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "vcruntime140.dll") or
+        std.ascii.eqlIgnoreCase(name, "vcruntime140_1.dll");
+}
+
 fn resolveImport(ctx_ptr: *anyopaque, dll: []const u8, name: ?[]const u8, ordinal: ?u16) ?usize {
+    // On Linux, use the real guest UCRT for CRT API-set imports so UCRT can
+    // initialize per-thread CRT state itself.
+    if (builtin.os.tag == .linux and std.mem.startsWith(u8, dll, "api-ms-win-crt-")) {
+        if (findDllPath(module.defaultAllocator(), "ucrtbase.dll")) |path| {
+            defer module.defaultAllocator().free(path);
+            const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
+            const m = loadModulePath(ctx, path, false) catch null;
+            if (m) |mm| {
+                if (module.getProcAddress(mm.base, name, ordinal, 0)) |ptr| return ptr;
+            }
+        }
+    }
+    // On Windows, guest CRT state must not come from host ucrtbase.
+    if (builtin.os.tag == .windows) {
+        if (name) |n| {
+            if (crt_core.resolve(n)) |ptr| return ptr;
+        }
+    }
+    // Windows host DLLs must not be guest-mapped.
+    if (host_imports.resolve(dll, name, ordinal)) |ptr| return ptr;
+    if (builtin.os.tag == .windows and host_imports.isHostDll(dll)) {
+        std.log.warn("[HOST] {s} could not be resolved from host; guest fallback", .{dll});
+    }
     // Already-loaded modules (including the module currently being patched)
     // satisfy cyclic imports.
     if (module.resolveImport(dll, name, ordinal)) |ptr| return ptr;
@@ -268,22 +348,26 @@ fn loadModulePath(ctx: *Ctx, path: []const u8, is_exe: bool) !*module.Module {
         exports,
         is_exe,
     );
+    m.host_mode = isHostModeDll(std.fs.path.basename(path));
+
+    _ = try pe_loader.patchImports(&image, .{
+        .ctx = @ptrCast(ctx),
+        .resolve = &resolveImport,
+        .arena = arenaPtr(),
+        .allocator = ctx.allocator,
+    });
 
     setupTls(&image, m) catch |err| {
         std.log.warn("[LOAD] TLS setup failed for {s}: {s}", .{ path, @errorName(err) });
     };
 
-    _ = try pe_loader.patchImports(&image, .{
-        .ctx = @ptrCast(ctx),
-        .resolve = &resolveImport,
-        .arena = null,
-        .allocator = ctx.allocator,
-    });
-
     if (!is_exe) {
         std.log.info("[LOAD] {s} mapped at 0x{x}, entry=0x{x}", .{ path, m.base, m.entry });
+        std.log.info("[LOAD] {s} TLS callbacks", .{path});
         runTlsCallbacks(m, DLL_PROCESS_ATTACH);
+        std.log.info("[LOAD] {s} DllMain", .{path});
         callDllMain(m, DLL_PROCESS_ATTACH);
+        std.log.info("[LOAD] {s} DllMain returned", .{path});
         std.log.info("[LOAD] {s} loaded at 0x{x}", .{ path, m.base });
     }
     return m;
@@ -307,12 +391,30 @@ fn loadLibraryA(name: [*:0]const u8) usize {
     return loadLibraryByName(allocator, io, std.mem.span(name));
 }
 
+fn isCryptoDll(name: []const u8) bool {
+    const base = std.fs.path.basename(name);
+    return std.ascii.eqlIgnoreCase(base, "bcrypt.dll") or
+        std.ascii.eqlIgnoreCase(base, "bcryptprimitives.dll") or
+        std.ascii.eqlIgnoreCase(base, "ncrypt.dll") or
+        std.ascii.eqlIgnoreCase(base, "crypt32.dll");
+}
+
 fn loadLibraryByName(allocator: Allocator, io: std.Io, name: []const u8) usize {
+    if (builtin.os.tag == .windows and host_imports.isHostDll(name)) {
+        if (host_imports.loadLibrary(name)) |base| {
+            std.log.info("[LOAD] host {s} at 0x{x}", .{ name, base });
+            return base;
+        }
+    }
     if (module.findByName(name)) |m| {
         m.refcount += 1;
         return m.base;
     }
-    if (isShimPreferred(name)) return 0x7FFE_0000;
+    if (isCryptoDll(name)) std.log.info("[LOAD] LoadLibrary(\"{s}\")", .{name});
+    if (isShimPreferred(name)) {
+        if (isCryptoDll(name)) std.log.info("[LOAD] {s} -> shim pseudo handle 0x7FFE0000", .{name});
+        return 0x7FFE_0000;
+    }
     const path = if (std.mem.indexOfAny(u8, name, "/\\") != null)
         allocator.dupe(u8, name) catch return 0
     else
