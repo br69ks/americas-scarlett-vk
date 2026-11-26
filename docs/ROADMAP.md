@@ -26,7 +26,6 @@ A cross-platform (Linux & Windows) High-Level Emulation (HLE) compatibility laye
 
 - [x] **Binary Loader (core):** Map the EXE and its DLLs, apply relocations, resolve the IAT, parse exports, run TLS callbacks and `DllMain`, and expose per-module `GetProcAddress`/`LoadLibrary`. **Remaining:** map all 16 shipped DLLs; GDK DLLs are still HLE shims.
 - [ ] **OS Kernel Shim (core):** TEB/PEB with `ProcessParameters`, stack bounds, TLS/FLS, futex-backed sync objects, thread creation, read-write file I/O, and `.pdata` lookup exist. **Remaining:** full `RtlVirtualUnwind`/SEH dispatch and many lower-level APIs.
-- [ ] **Security & Auth:** **Out of scope.** Xbox hypervisor/XSP DRM/licensing checks are not stubbed; circumventing them is not part of this project.
 - [ ] **Unified Memory (UMA) — partial:** `XMemAlloc`/`XMemVirtualAlloc` use host `mmap` with `MAP_NORESERVE`; `XMemAllocatePhysicalPages` is still a no-op and there is no dirty-page/VRAM tracking.
 - [ ] **Asset Streaming — partial:** DStorage factory/file/queue shims and synchronous reads work; `RPF9` packfile parsing/decryption, BCPack/`chad`, and async queues are not implemented.
 - [ ] **Offline Shader Lifter:** Not started (target: ~26,500 RDNA 2 shaders to SPIR-V).
