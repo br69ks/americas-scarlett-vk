@@ -516,9 +516,6 @@ pub fn patchImports(image: *const MappedImage, resolver: ImportResolver) !Import
                     if (resolver.arena) |arena| target = try arena.emitThunk(ptr);
                 }
                 std.mem.writeInt(u64, iat_slot, target, .little);
-                if (target < 0x1_0000_0000) {
-                    std.log.err("[IAT] LOW target {s}!{s} -> 0x{x}", .{ dll_name, name_opt orelse "ordinal", target });
-                }
                 stats.resolved += 1;
             } else if (resolver.arena) |arena| {
                 const allocator = resolver.allocator orelse return error.ResolverHasNoAllocator;
