@@ -19,8 +19,9 @@ const game_input = @import("shims/game_input.zig");
 const registry = @import("shims/generated/registry.zig");
 const crt_extra = @import("shims/crt_extra.zig");
 const wsa = @import("shims/wsa.zig");
+const d3d12_xs = @import("shims/d3d12_xs.zig");
 const host_imports = @import("host_imports.zig");
-const host_tls = @import("host_tls.zig");
+const loader_lock = @import("loader_lock.zig");
 
 const Allocator = std.mem.Allocator;
 const DllMainFn = *const fn (usize, u32, ?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32;
@@ -80,13 +81,17 @@ pub const LoadedExe = struct {
 };
 
 pub fn loadExecutable(allocator: Allocator, io: std.Io, path: []const u8, display_path: []const u8) !LoadedExe {
+    loader_lock.lock();
+    defer loader_lock.unlock();
     var ctx = Ctx{ .allocator = allocator, .io = io };
     var image = try pe_loader.mapImage(allocator, io, path);
     errdefer image.deinit();
+    teb.setProcessStackSizes(image.stack_reserve, image.stack_commit);
 
     const exports = try loadExports(allocator, &image);
     const m = try module.register(
         allocator,
+        path,
         display_path,
         std.fs.path.basename(display_path),
         image.base_addr,
@@ -99,16 +104,16 @@ pub fn loadExecutable(allocator: Allocator, io: std.Io, path: []const u8, displa
     );
     m.host_mode = isHostModeDll(std.fs.path.basename(path));
 
+    setupTls(&image, m) catch |err| {
+        std.log.err("TLS setup failed for {s}: {s}", .{ path, @errorName(err) });
+    };
+
     _ = try pe_loader.patchImports(&image, .{
         .ctx = @ptrCast(&ctx),
         .resolve = &resolveImport,
         .arena = arenaPtr(),
         .allocator = allocator,
     });
-
-    setupTls(&image, m) catch |err| {
-        std.log.err("TLS setup failed for {s}: {s}", .{ path, @errorName(err) });
-    };
 
     runTlsCallbacks(m, DLL_PROCESS_ATTACH);
     return .{ .image = image, .mod = m };
@@ -131,9 +136,17 @@ fn setupTls(image: *const pe_loader.MappedImage, m: *module.Module) !void {
     if (image.tls_block_addr == 0) return;
     const index = try teb.allocModuleTls(image.tls_block_addr, image.tls_block_size);
     m.tls_index = index;
-    if (image.tls_index_va != 0) {
+    // The `_tls_index` slot lives inside the mapped image.  Never write
+    // through a bogus relocation/TLS-directory value.
+    if (image.tls_index_va != 0 and
+        image.tls_index_va >= image.base_addr and
+        image.tls_index_va + @sizeOf(u32) <= image.base_addr + image.image_size and
+        image.tls_index_va % @alignOf(u32) == 0)
+    {
         const idx_ptr: *u32 = @ptrFromInt(image.tls_index_va);
         idx_ptr.* = index;
+    } else {
+        std.log.warn("[TLS] {s}: ignoring out-of-image _tls_index VA 0x{x}", .{ m.name, image.tls_index_va });
     }
 }
 
@@ -152,20 +165,6 @@ fn runTlsCallbacks(m: *module.Module, reason: u32) void {
     }
 }
 
-
-pub fn runThreadTlsCallbacks() void {
-    for (module.all()) |m| {
-        if (m.tls_callbacks == 0) continue;
-        const callbacks: [*]const usize = @ptrFromInt(m.tls_callbacks);
-        var i: usize = 0;
-        while (callbacks[i] != 0) : (i += 1) {
-            if (i > 256) break;
-            const f: DllMainFn = @ptrFromInt(callbacks[i]);
-            _ = f(m.base, 2, null); // DLL_THREAD_ATTACH
-        }
-    }
-}
-
 fn callDllMain(m: *module.Module, reason: u32) void {
     if (m.entry == 0 or m.is_exe) return;
     const f: DllMainFn = @ptrFromInt(m.entry);
@@ -177,6 +176,8 @@ fn callDllMain(m: *module.Module, reason: u32) void {
 }
 
 fn threadAttach() void {
+    loader_lock.lock();
+    defer loader_lock.unlock();
     for (module.all()) |m| {
         runTlsCallbacks(m, DLL_THREAD_ATTACH);
         callDllMain(m, DLL_THREAD_ATTACH);
@@ -184,6 +185,8 @@ fn threadAttach() void {
 }
 
 fn threadDetach() void {
+    loader_lock.lock();
+    defer loader_lock.unlock();
     var i = module.all().len;
     while (i > 0) {
         i -= 1;
@@ -210,6 +213,7 @@ fn shimResolve(dll: []const u8, name: ?[]const u8, ordinal: ?u16) ?usize {
     if (dstorage.resolve(n)) |ptr| return ptr;
     if (win32_fs.resolve(n)) |ptr| return ptr;
     if (wsa.resolve(n)) |ptr| return ptr;
+    if (d3d12_xs.resolve(n)) |ptr| return ptr;
     return registry.resolve(dll, n, null);
 }
 
@@ -220,17 +224,18 @@ fn resolveShimByName(name: []const u8) ?usize {
     if (xmem.resolve(name)) |ptr| return ptr;
     if (dstorage.resolve(name)) |ptr| return ptr;
     if (win32_fs.resolve(name)) |ptr| return ptr;
+    if (d3d12_xs.resolve(name)) |ptr| return ptr;
     return null;
 }
 
 fn isShimPreferred(dll: []const u8) bool {
     const name = std.fs.path.basename(dll);
     const preferred = [_][]const u8{
-        "kernel32.dll", "ntdll.dll", "user32.dll", "advapi32.dll", "bcrypt.dll",
-        "ws2_32.dll",   "winhttp.dll", "mfplat.dll", "mfreadwrite.dll", "xmem.dll",
-        "chad.dll",     "xapu.dll",   "acphal.dll", "d3d12_xs.dll",   "xg_xs.dll",
-        "xboxbvhbuilder.dll", "bink2scarlett.dll", "gameinput.dll", "xcrdapi.dll",
-        "libhttpclient.gdk.dll", "amd_fidelityfx_loader_xbox.dll", "xgameruntime.dll",
+        "kernel32.dll",                   "ntdll.dll",         "user32.dll",    "advapi32.dll",    "bcrypt.dll",
+        "ws2_32.dll",                     "winhttp.dll",       "mfplat.dll",    "mfreadwrite.dll", "xmem.dll",
+        "chad.dll",                       "xapu.dll",          "acphal.dll",    "d3d12_xs.dll",    "xg_xs.dll",
+        "xboxbvhbuilder.dll",             "bink2scarlett.dll", "gameinput.dll", "xcrdapi.dll",     "libhttpclient.gdk.dll",
+        "amd_fidelityfx_loader_xbox.dll", "xgameruntime.dll",
     };
     for (preferred) |p| {
         if (std.ascii.eqlIgnoreCase(name, p)) return true;
@@ -283,16 +288,36 @@ fn isHostModeDll(name: []const u8) bool {
 }
 
 fn resolveImport(ctx_ptr: *anyopaque, dll: []const u8, name: ?[]const u8, ordinal: ?u16) ?usize {
+    if (builtin.os.tag == .linux) {
+        if (name) |n| {
+            if (std.mem.eql(u8, n, "RtlCaptureContext") or std.mem.eql(u8, n, "RtlCaptureStackBackTrace")) {
+                return shimResolve(dll, name, ordinal);
+            }
+        }
+    }
     // On Linux, use the real guest UCRT for CRT API-set imports so UCRT can
     // initialize per-thread CRT state itself.
-    if (builtin.os.tag == .linux and std.mem.startsWith(u8, dll, "api-ms-win-crt-")) {
-        if (findDllPath(module.defaultAllocator(), "ucrtbase.dll")) |path| {
+    if (builtin.os.tag == .linux and
+        (std.mem.startsWith(u8, dll, "api-ms-win-crt-") or
+            std.mem.startsWith(u8, dll, "api-ms-win-core-rtlsupport")))
+    {
+        const mm_opt: ?*module.Module = module.findByName("ucrtbase.dll") orelse blk: {
+            const path = findDllPath(module.defaultAllocator(), "ucrtbase.dll") orelse break :blk null;
             defer module.defaultAllocator().free(path);
             const ctx: *Ctx = @ptrCast(@alignCast(ctx_ptr));
-            const m = loadModulePath(ctx, path, false) catch null;
-            if (m) |mm| {
-                if (module.getProcAddress(mm.base, name, ordinal, 0)) |ptr| return ptr;
+            break :blk loadModulePath(ctx, path, false) catch null;
+        };
+        if (mm_opt) |mm| {
+            if (std.mem.startsWith(u8, dll, "api-ms-win-core-rtlsupport")) {
+                if (name) |n| {
+                    if (std.mem.eql(u8, n, "RtlCaptureContext") or std.mem.eql(u8, n, "RtlCaptureStackBackTrace")) return shimResolve(dll, name, ordinal);
+                    if (module.getProcAddress(mm.base, n, ordinal, 0)) |ptr| {
+                        const target_rva = std.mem.readInt(u32, @as([*]const u8, @ptrFromInt(ptr))[0..4], .little);
+                        if (target_rva >= 0x1000 and target_rva < 0x10000000) return mm.base + target_rva;
+                    }
+                }
             }
+            if (module.getProcAddress(mm.base, name, ordinal, 0)) |ptr| return ptr;
         }
     }
     // On Windows, guest CRT state must not come from host ucrtbase.
@@ -328,6 +353,8 @@ fn resolveImport(ctx_ptr: *anyopaque, dll: []const u8, name: ?[]const u8, ordina
 }
 
 fn loadModulePath(ctx: *Ctx, path: []const u8, is_exe: bool) !*module.Module {
+    loader_lock.lock();
+    defer loader_lock.unlock();
     const base_name = std.fs.path.basename(path);
     if (module.findByName(base_name)) |existing| {
         existing.refcount += 1;
@@ -336,9 +363,11 @@ fn loadModulePath(ctx: *Ctx, path: []const u8, is_exe: bool) !*module.Module {
 
     var image = try pe_loader.mapImage(ctx.allocator, ctx.io, path);
     const exports = try loadExports(ctx.allocator, &image);
+    const virtual_path = try std.fmt.allocPrint(ctx.allocator, "G:\\{s}", .{base_name});
     const m = try module.register(
         ctx.allocator,
         path,
+        virtual_path,
         base_name,
         image.base_addr,
         image.image_size,
@@ -374,7 +403,10 @@ fn loadModulePath(ctx: *Ctx, path: []const u8, is_exe: bool) !*module.Module {
 }
 
 fn nameFromW(allocator: Allocator, name: [*:0]const u16) ?[]u8 {
-    return std.unicode.utf16LeToUtf8AllocZ(allocator, std.mem.span(name)) catch null;
+    // No NUL sentinel is needed by loadLibraryByName, and the exact-size
+    // allocation lets the caller free it with allocator.free without a
+    // DebugAllocator length mismatch.
+    return std.unicode.utf16LeToUtf8Alloc(allocator, std.mem.span(name)) catch null;
 }
 
 fn loadLibraryW(name: [*:0]const u16) usize {
@@ -400,6 +432,8 @@ fn isCryptoDll(name: []const u8) bool {
 }
 
 fn loadLibraryByName(allocator: Allocator, io: std.Io, name: []const u8) usize {
+    loader_lock.lock();
+    defer loader_lock.unlock();
     if (builtin.os.tag == .windows and host_imports.isHostDll(name)) {
         if (host_imports.loadLibrary(name)) |base| {
             std.log.info("[LOAD] host {s} at 0x{x}", .{ name, base });
@@ -429,6 +463,8 @@ fn loadLibraryByName(allocator: Allocator, io: std.Io, name: []const u8) usize {
 }
 
 fn freeLibrary(base: usize) i32 {
+    loader_lock.lock();
+    defer loader_lock.unlock();
     return module.release(base);
 }
 
@@ -437,6 +473,8 @@ pub fn getProcAddress(base: usize, name: ?[]const u8, ordinal: ?u16) ?usize {
 }
 
 pub fn processDetach() void {
+    loader_lock.lock();
+    defer loader_lock.unlock();
     var i = module.all().len;
     while (i > 0) {
         i -= 1;

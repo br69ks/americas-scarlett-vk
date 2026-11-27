@@ -8,13 +8,10 @@ const builtin = @import("builtin");
 
 const HMODULE = usize;
 
-const HostFn = *const anyopaque;
-
 extern "kernel32" fn LoadLibraryW(name: [*:0]const u16) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn LoadLibraryExW(name: [*:0]const u16, file: usize, flags: u32) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetProcAddress(module: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
 extern "kernel32" fn GetLastError() callconv(.winapi) u32;
-extern "kernel32" fn GetModuleHandleW(name: ?[*:0]const u16) callconv(.winapi) usize;
 extern "kernel32" fn GetModuleFileNameW(module: usize, name: [*]u16, size: u32) callconv(.winapi) u32;
 extern "kernel32" fn CopyFileW(existing: [*:0]const u16, new: [*:0]const u16, fail_if_exists: i32) callconv(.winapi) i32;
 
@@ -151,33 +148,6 @@ pub fn getProcAddress(base: usize, name: ?[]const u8, ordinal: ?u16) ?usize {
         return @intFromPtr(proc);
     }
     return null;
-}
-
-fn addTlsIndex(out: []u32, n: *usize, base_addr: usize) void {
-    if (base_addr < 0x10000) return;
-    const base: [*]const u8 = @ptrFromInt(base_addr);
-    const e_lfanew = std.mem.readInt(u32, base[0x3C..][0..4], .little);
-    const nt = base + e_lfanew;
-    const optional = nt + 0x18;
-    if (std.mem.readInt(u16, optional[0..2], .little) != 0x20B) return;
-    const tls_rva = std.mem.readInt(u32, optional[0xB8..][0..4], .little);
-    if (tls_rva == 0) return;
-    const tls = base + tls_rva;
-    const index_va = std.mem.readInt(u64, tls[0x10..][0..8], .little);
-    if (index_va == 0) return;
-    const idx_ptr: [*]const u8 = @ptrFromInt(@as(usize, @intCast(index_va)));
-    const idx = std.mem.readInt(u32, idx_ptr[0..4], .little);
-    if (n.* < out.len) {
-        out[n.*] = idx;
-        n.* += 1;
-    }
-}
-
-pub fn usedTlsIndexes(out: []u32) usize {
-    var n: usize = 0;
-    addTlsIndex(out, &n, GetModuleHandleW(null));
-    for (g_cache[0..g_cache_len]) |c| addTlsIndex(out, &n, c.module);
-    return n;
 }
 
 pub fn isHostModule(base: usize) bool {

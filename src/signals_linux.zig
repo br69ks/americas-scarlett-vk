@@ -1,21 +1,35 @@
-//! Async-signal-safe crash reporting for the Linux host.
+//! Async-signal-safe crash reporting and guest exception translation.
 //!
-//! This replaces the previous "SIGTRAP means int3, so NOP it" behaviour.  A
-//! breakpoint in the guest image is a real failure: report where it happened
-//! and stop.  Nothing here uses the allocator, std.log, or any other lock.
+//! A fault whose RIP is inside a loaded guest image is no longer a loader
+//! crash: it becomes a Windows exception (`STATUS_ACCESS_VIOLATION`,
+//! `STATUS_ILLEGAL_INSTRUCTION`, `STATUS_*_DIVIDE_BY_ZERO`,
+//! `STATUS_STACK_OVERFLOW`, `STATUS_BREAKPOINT`, ...) and is dispatched through
+//! the guest SEH machinery in ../seh.zig (VEH, `.pdata` handlers, RtlUnwindEx).
+//! Faults in the loader itself keep the register/stack diagnostics.
+//!
+//! The handler must not take locks or allocate: image lookups are lock-free,
+//! the unwinder uses a fixed stack buffer, and all messages use raw write(2).
 
 const std = @import("std");
 const builtin = @import("builtin");
+const linux = std.os.linux;
+const teb = @import("teb.zig");
+const module = @import("module.zig");
+const seh = @import("seh.zig");
 
 comptime {
     if (builtin.os.tag != .linux) @compileError("signals_linux is Linux-only");
 }
 
-const linux = std.os.linux;
-
-/// Guest image range, used to turn a host RIP into a PE RVA.
+/// Guest image range, used to turn a host RIP into a PE RVA in diagnostics.
 pub var image_base: usize = 0;
 pub var image_size: usize = 0;
+
+const PROT_READ: i32 = 0x1;
+const PROT_WRITE: i32 = 0x2;
+const MAP_PRIVATE: i32 = 0x02;
+const MAP_ANONYMOUS: i32 = 0x20;
+const SIG_UNBLOCK: u32 = 1;
 
 const Stack = extern struct {
     sp: u64,
@@ -61,12 +75,13 @@ const REG_RAX = 13;
 const REG_RCX = 14;
 const REG_RSP = 15;
 const REG_RIP = 16;
+const REG_EFL = 17;
+const REG_CSGSFS = 18;
 
 fn writeAll(bytes: []const u8) void {
     var off: usize = 0;
     while (off < bytes.len) {
         const rc = linux.write(2, bytes.ptr + off, bytes.len - off);
-        // EINTR (-4) means retry; anything else non-positive means give up.
         const signed: isize = @bitCast(rc);
         if (signed == -4) continue;
         if (signed <= 0) return;
@@ -83,6 +98,10 @@ fn inImage(addr: usize) bool {
     return image_base != 0 and addr >= image_base and addr < image_base + image_size;
 }
 
+fn inGuestCode(addr: usize) bool {
+    return module.findImageInfo(addr) != null;
+}
+
 fn signalName(sig: u32) []const u8 {
     return switch (sig) {
         4 => "SIGILL",
@@ -94,8 +113,8 @@ fn signalName(sig: u32) []const u8 {
     };
 }
 
-fn dumpContext(buf: []u8, ctx: *const UContext) void {
-    const g = &ctx.mcontext.gregs;
+fn dumpContext(buf: []u8, uc: *const UContext) void {
+    const g = &uc.mcontext.gregs;
     const rip: usize = @intCast(g[REG_RIP]);
     const rsp: usize = @intCast(g[REG_RSP]);
     if (inImage(rip)) {
@@ -131,8 +150,8 @@ fn dumpContext(buf: []u8, ctx: *const UContext) void {
     var start: ?usize = null;
     var j: usize = 0;
     while (j < 1024) : (j += 1) {
-        const c = bytes[j];
-        const printable = c >= 0x20 and c < 0x7f;
+        const ch = bytes[j];
+        const printable = ch >= 0x20 and ch < 0x7f;
         if (printable) {
             if (start == null) start = j;
         } else if (start) |s| {
@@ -144,41 +163,197 @@ fn dumpContext(buf: []u8, ctx: *const UContext) void {
     }
 }
 
-fn handler(sig: linux.SIG, info: *const linux.siginfo_t, uctx: ?*anyopaque) callconv(.c) void {
+fn hostFailure(sig: linux.SIG, info: *const linux.siginfo_t, uc: *const UContext) noreturn {
     var buf: [1024]u8 = undefined;
-    const ctx: ?*const UContext = if (uctx) |p| @ptrCast(@alignCast(p)) else null;
-
-    if (sig == .TRAP) {
-        // Linux delivers #BP with RIP pointing *after* the one-byte int3.
-        // The old handler patched the byte at RIP and then incremented RIP
-        // again, skipping the first byte of the following instruction.
-        var int3_addr: usize = 0;
-        var is_int3 = false;
-        if (ctx) |c| {
-            const rip: usize = @intCast(c.mcontext.gregs[REG_RIP]);
-            if (rip != 0) {
-                int3_addr = rip - 1;
-                is_int3 = inImage(int3_addr) and @as(*const u8, @ptrFromInt(int3_addr)).* == 0xCC;
-            }
-        }
-
-        if (is_int3) {
-            writeFmt(&buf, "\n[FATAL] guest breakpoint (int3) at 0x{x} (RVA=0x{x})\n", .{
-                int3_addr, int3_addr - image_base,
-            });
-            writeAll("[FATAL] This is the engine's own assert/break path. It is not patched.\n");
-        } else {
-            writeAll("\n[FATAL] unexpected SIGTRAP outside a guest int3\n");
-        }
-        if (ctx) |c| dumpContext(&buf, c);
-        linux.exit_group(133); // 128 + SIGTRAP
-    }
-
-    writeFmt(&buf, "\n[FATAL] {s} (signal {d})\n", .{ signalName(@intFromEnum(sig)), @intFromEnum(sig) });
-    if (ctx) |c| dumpContext(&buf, c);
+    writeFmt(&buf, "\n[FATAL] {s} (signal {d}) in host/loader code\n", .{
+        signalName(@intFromEnum(sig)), @intFromEnum(sig),
+    });
+    dumpContext(&buf, uc);
     writeFmt(&buf, "  fault_addr=0x{x}\n", .{@intFromPtr(info.fields.sigfault.addr)});
     writeAll("[FATAL] aborting; stack contents are not trusted\n");
     linux.exit_group(128 + @as(i32, @intCast(@as(u8, @truncate(@intFromEnum(sig))))));
+}
+
+fn readU32(p: [*]const u8, off: usize) u32 {
+    return std.mem.readInt(u32, p[off..][0..4], .little);
+}
+
+/// Build a Windows CONTEXT from the Linux signal frame.
+fn contextFromUContext(uc: *const UContext) seh.Context {
+    const g = &uc.mcontext.gregs;
+    var ctx = seh.Context{};
+    ctx.rax = g[REG_RAX];
+    ctx.rcx = g[REG_RCX];
+    ctx.rdx = g[REG_RDX];
+    ctx.rbx = g[REG_RBX];
+    ctx.rsp = g[REG_RSP];
+    ctx.rbp = g[REG_RBP];
+    ctx.rsi = g[REG_RSI];
+    ctx.rdi = g[REG_RDI];
+    ctx.r8 = g[REG_R8];
+    ctx.r9 = g[REG_R9];
+    ctx.r10 = g[REG_R10];
+    ctx.r11 = g[REG_R11];
+    ctx.r12 = g[REG_R12];
+    ctx.r13 = g[REG_R13];
+    ctx.r14 = g[REG_R14];
+    ctx.r15 = g[REG_R15];
+    ctx.rip = g[REG_RIP];
+    ctx.eflags = @truncate(g[REG_EFL]);
+    ctx.seg_cs = @truncate(g[REG_CSGSFS]);
+    ctx.context_flags = seh.CONTEXT_FULL;
+    if (uc.mcontext.fpregs) |fp| {
+        // The kernel's fpstate is the legacy FXSAVE layout, which is exactly
+        // CONTEXT.FltSave (Xmm0-15 at FltSave+0xA0 == CONTEXT+0x1A0), so the
+        // whole 512-byte area can be carried over and later `fxrstor`ed.
+        const base: [*]const u8 = @ptrCast(fp);
+        ctx.mx_csr = readU32(base, 0x18);
+        const fpu: *const [0x200]u8 = @ptrCast(base);
+        @memcpy(std.mem.asBytes(&ctx._flt_head), fpu[0..0xA0]);
+        const xmm_bytes: *const [0x100]u8 = @ptrCast(base + 0xA0);
+        @memcpy(std.mem.asBytes(&ctx.xmm), xmm_bytes);
+        const tail: *const [0x60]u8 = @ptrCast(base + 0x1A0);
+        @memcpy(std.mem.asBytes(&ctx._flt_tail), tail);
+    }
+    return ctx;
+}
+
+fn stackOverflow(fault: usize, rsp: u64) bool {
+    const limit = seh.stackLimit();
+    if (limit == 0) return false;
+    const near_limit = fault + 0x100000 >= limit and fault < limit + 0x1000;
+    if (!near_limit) return false;
+    return rsp <= limit + 0x40000;
+}
+
+const Translated = struct {
+    code: u32,
+    parameters: [2]u64 = .{ 0, 0 },
+    count: u32 = 0,
+};
+
+fn translate(sig: linux.SIG, info: *const linux.siginfo_t, ctx: *const seh.Context) Translated {
+    const fault: u64 = @intFromPtr(info.fields.sigfault.addr);
+    const rsp = ctx.rsp;
+    switch (sig) {
+        .SEGV => {
+            if (stackOverflow(@intCast(fault), rsp)) {
+                return .{ .code = seh.STATUS_STACK_OVERFLOW, .parameters = .{ 0, fault }, .count = 2 };
+            }
+            const code: u32 = switch (info.code) {
+                1 => seh.STATUS_IN_PAGE_ERROR, // SEGV_MAPERR: not mapped at all
+                else => seh.STATUS_ACCESS_VIOLATION,
+            };
+            return .{ .code = code, .parameters = .{ 0, fault }, .count = 2 };
+        },
+        .ILL => {
+            const code: u32 = switch (info.code) {
+                5 => seh.STATUS_PRIVILEGED_INSTRUCTION, // ILL_PRVOPC
+                else => seh.STATUS_ILLEGAL_INSTRUCTION,
+            };
+            return .{ .code = code, .parameters = .{ 0, 0 }, .count = 0 };
+        },
+        .FPE => {
+            const code: u32 = switch (info.code) {
+                1 => seh.STATUS_INTEGER_DIVIDE_BY_ZERO,
+                2 => seh.STATUS_INTEGER_OVERFLOW,
+                3 => seh.STATUS_FLOAT_DIVIDE_BY_ZERO,
+                4 => seh.STATUS_FLOAT_OVERFLOW,
+                5 => seh.STATUS_FLOAT_UNDERFLOW,
+                6 => seh.STATUS_FLOAT_INEXACT_RESULT,
+                7 => seh.STATUS_FLOAT_INVALID_OPERATION,
+                8 => seh.STATUS_FLOAT_STACK_CHECK,
+                else => seh.STATUS_FLOAT_INVALID_OPERATION,
+            };
+            return .{ .code = code, .parameters = .{ 0, 0 }, .count = 0 };
+        },
+        .BUS => {
+            const code: u32 = if (info.code == 1) seh.STATUS_DATATYPE_MISALIGNMENT else seh.STATUS_ACCESS_VIOLATION;
+            return .{ .code = code, .parameters = .{ 0, fault }, .count = 2 };
+        },
+        else => return .{ .code = seh.STATUS_BREAKPOINT, .parameters = .{ 0, 0 }, .count = 0 },
+    }
+}
+
+fn unblockSignal(sig: linux.SIG) void {
+    var set: linux.sigset_t = .{0};
+    const bit: u6 = @intCast(@intFromEnum(sig) - 1);
+    set[0] |= @as(@TypeOf(set[0]), 1) << bit;
+    _ = linux.sigprocmask(SIG_UNBLOCK, &set, null);
+}
+
+fn guestHandler(sig: linux.SIG, info: *const linux.siginfo_t, uc: *const UContext) noreturn {
+    var ctx = contextFromUContext(uc);
+
+    var record = std.mem.zeroes(seh.ExceptionRecord);
+    record.exception_address = ctx.rip;
+
+    var int3_addr: usize = 0;
+    if (sig == .TRAP) {
+        // Linux delivers #BP with RIP pointing past the one-byte int3.
+        const after: usize = @intCast(ctx.rip);
+        const candidate = after -% 1;
+        const is_int3 = inGuestCode(candidate) and
+            @as(*const u8, @ptrFromInt(candidate)).* == 0xCC;
+        if (is_int3) {
+            int3_addr = candidate;
+            record.exception_code = seh.STATUS_BREAKPOINT;
+            record.exception_address = int3_addr;
+        } else {
+            record.exception_code = seh.STATUS_SINGLE_STEP;
+        }
+    } else {
+        const t = translate(sig, info, &ctx);
+        record.exception_code = t.code;
+        record.number_parameters = t.count;
+        record.exception_information[0] = t.parameters[0];
+        record.exception_information[1] = t.parameters[1];
+    }
+
+    // A handled guest exception leaves through restoreAndJump (or RtlUnwindEx)
+    // rather than sigreturn, so the kernel would keep this signal blocked for
+    // the rest of the thread's life.  Unblock it before entering guest code.
+    unblockSignal(sig);
+
+    if (seh.dispatchException(&record, &ctx)) {
+        // A handler asked to continue execution (context may have been fixed).
+        seh.continueExecution(&ctx);
+    }
+    _ = seh.callUnhandledFilter(&record, &ctx);
+
+    var buf: [1024]u8 = undefined;
+    if (record.exception_code == seh.STATUS_BREAKPOINT) {
+        writeFmt(&buf, "\n[FATAL] guest breakpoint (int3) at 0x{x} (RVA=0x{x})\n", .{
+            int3_addr, int3_addr -% image_base,
+        });
+        writeAll("[FATAL] This is the engine's own assert/break path. It is not patched.\n");
+    } else {
+        writeFmt(&buf, "\n[FATAL] unhandled guest exception 0x{x} ({s}, signal {d})\n", .{
+            record.exception_code, signalName(@intFromEnum(sig)), @intFromEnum(sig),
+        });
+    }
+    dumpContext(&buf, uc);
+    writeFmt(&buf, "  fault_addr=0x{x}\n", .{@intFromPtr(info.fields.sigfault.addr)});
+    writeAll("[FATAL] aborting; stack contents are not trusted\n");
+    linux.exit_group(128 + @as(i32, @intCast(@as(u8, @truncate(@intFromEnum(sig))))));
+}
+
+fn handler(sig: linux.SIG, info: *const linux.siginfo_t, uctx: ?*anyopaque) callconv(.c) void {
+    const ucp = uctx orelse {
+        writeAll("\n[FATAL] signal without a ucontext\n");
+        linux.exit_group(133);
+    };
+    const uc: *const UContext = @ptrCast(@alignCast(ucp));
+    const rip: usize = @intCast(uc.mcontext.gregs[REG_RIP]);
+
+    if (!inGuestCode(rip)) {
+        // A guest int3 is reported with RIP one byte past the instruction.
+        if (sig == .TRAP and inGuestCode(rip -% 1)) {
+            guestHandler(sig, info, uc);
+        }
+        hostFailure(sig, info, uc);
+    }
+    guestHandler(sig, info, uc);
 }
 
 pub fn setImage(base: usize, size: usize) void {
@@ -186,11 +361,33 @@ pub fn setImage(base: usize, size: usize) void {
     image_size = size;
 }
 
+// ---------------------------------------------------------------------------
+// Alternate signal stack (per thread)
+// ---------------------------------------------------------------------------
+
+const ALT_STACK_SIZE = 128 * 1024;
+threadlocal var g_alt_stack: ?[]u8 = null;
+
+/// Install an alternate stack on the calling thread so a stack overflow can
+/// still be translated (the handler would otherwise run on the exhausted
+/// stack).  Called for the main thread by install() and for every guest thread
+/// through `teb.thread_init_hook`.
+pub fn installForThread() void {
+    if (g_alt_stack != null) return;
+    const mem = std.heap.page_allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(16), ALT_STACK_SIZE) catch return;
+    var ss = linux.stack_t{ .sp = mem.ptr, .flags = 0, .size = mem.len };
+    if (linux.sigaltstack(&ss, null) != 0) return;
+    g_alt_stack = mem;
+}
+
 pub fn install() void {
+    installForThread();
+    teb.thread_init_hook = &installForThread;
+
     var act = linux.Sigaction{
         .handler = .{ .sigaction = &handler },
         .mask = std.mem.zeroes(linux.sigset_t),
-        .flags = linux.SA.SIGINFO,
+        .flags = linux.SA.SIGINFO | linux.SA.ONSTACK,
     };
 
     inline for ([_]linux.SIG{ .TRAP, .SEGV, .BUS, .ILL, .FPE }) |sig| {

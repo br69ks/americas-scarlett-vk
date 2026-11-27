@@ -3,14 +3,15 @@
 //! method whose behavior is unknown is fail-closed.
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const HRESULT = i32;
 const S_OK: HRESULT = 0;
 const E_NOTIMPL: HRESULT = @bitCast(@as(u32, 0x8000_4001));
 const E_INVALIDARG: HRESULT = @bitCast(@as(u32, 0x8007_0057));
 const E_FAIL: HRESULT = @bitCast(@as(u32, 0x8000_4005));
-const E_PENDING: HRESULT = @bitCast(@as(u32, 0x8000_000A));
+const E_NOINTERFACE: HRESULT = @bitCast(@as(u32, 0x8000_4002));
+const E_ABORT: HRESULT = @bitCast(@as(u32, 0x8000_4004));
+const E_OUTOFMEMORY: HRESULT = @bitCast(@as(u32, 0x8007_000E));
 const NO_PACKAGE: HRESULT = @bitCast(@as(u32, 0x8924_5208));
 
 const Guid = extern struct {
@@ -37,17 +38,7 @@ const AsyncBlock = extern struct {
     internal: [4]usize,
 };
 
-const ProviderData = extern struct {
-    block: *AsyncBlock,
-    buffer_size: usize,
-    buffer: ?*anyopaque,
-    context: ?*anyopaque,
-};
-
-const ProviderFn = *const fn (u32, *const ProviderData) callconv(.{ .x86_64_win = .{} }) HRESULT;
-const WorkFn = *const fn (*AsyncBlock) callconv(.{ .x86_64_win = .{} }) void;
 const CompletionFn = *const fn (*AsyncBlock) callconv(.{ .x86_64_win = .{} }) void;
-const CallbackFn = *const fn (?*anyopaque, bool) callconv(.{ .x86_64_win = .{} }) void;
 
 const Object = extern struct { lpVtbl: *const anyopaque };
 
@@ -66,68 +57,10 @@ fn missing(_: *Object) callconv(.{ .x86_64_win = .{} }) HRESULT {
     return E_NOTIMPL;
 }
 
-const Queue = extern struct {
-    work_mode: u32,
-    completion_mode: u32,
-    live: bool = true,
-};
-
-const Task = struct {
-    queue: ?*Queue,
-    port: u32,
-    context: ?*anyopaque,
-    callback: ?CallbackFn,
-};
-
-var g_queues: [8]Queue = undefined;
-var g_queue_count: usize = 0;
-var g_tasks: [64]Task = undefined;
-var g_task_count: usize = 0;
-var g_task_lock = std.atomic.Value(u32).init(0);
-fn lockTasks() void {
-    while (g_task_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-        while (g_task_lock.load(.monotonic) != 0) std.atomic.spinLoopHint();
-    }
-}
-fn unlockTasks() void {
-    g_task_lock.store(0, .release);
-}
-
-fn immediate(mode: u32) bool {
-    return mode == 3;
-}
-fn enqueue(q: ?*Queue, port: u32, ctx: ?*anyopaque, cb: ?CallbackFn) void {
-    if (immediate(if (port == 0) (q orelse &g_queues[0]).work_mode else (q orelse &g_queues[0]).completion_mode)) {
-        if (cb) |f| f(ctx, false);
-        return;
-    }
-    lockTasks();
-    defer unlockTasks();
-    if (g_task_count < g_tasks.len) {
-        g_tasks[g_task_count] = .{ .queue = q, .port = port, .context = ctx, .callback = cb };
-        g_task_count += 1;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // XAsync
 // ---------------------------------------------------------------------------
 
-fn aGetStatus(_: *Object, b: ?*AsyncBlock, wait: u8) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    const block = b orelse return E_INVALIDARG;
-    if (block.internal[1] == 2) return S_OK;
-    _ = wait;
-    return E_PENDING;
-}
-fn aGetResultSize(_: *Object, b: ?*AsyncBlock, out: ?*usize) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    const block = b orelse return E_INVALIDARG;
-    if (out) |o| o.* = block.internal[3];
-    return if (block.internal[1] == 2) S_OK else E_PENDING;
-}
-fn aCancel(_: *Object, b: ?*AsyncBlock) callconv(.{ .x86_64_win = .{} }) void {
-    const block = b orelse return;
-    block.internal[1] = 2;
-}
 fn complete(block: *AsyncBlock, hr: HRESULT, size: usize) void {
     block.internal[1] = 2;
     block.internal[2] = @as(u32, @bitCast(hr));
@@ -137,176 +70,120 @@ fn complete(block: *AsyncBlock, hr: HRESULT, size: usize) void {
         cb(block);
     }
 }
-fn aRun(_: *Object, b: ?*AsyncBlock, work: ?WorkFn) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    const block = b orelse return E_INVALIDARG;
-    const w = work orelse return E_INVALIDARG;
-    block.internal[1] = 1;
-    w(block);
-    if (block.internal[1] != 2) complete(block, S_OK, 0);
-    return S_OK;
-}
-fn aBegin(_: *Object, b: ?*AsyncBlock, context: ?*anyopaque, identity: ?*const anyopaque, name: ?[*:0]const u8, provider: ?ProviderFn) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = identity;
-    _ = name;
-    const block = b orelse return E_INVALIDARG;
-    block.context = @intFromPtr(context);
-    block.internal[0] = if (provider) |p| @intFromPtr(p) else 0;
-    block.internal[1] = 1;
-    block.internal[2] = 0;
-    block.internal[3] = 0;
-    return S_OK;
-}
-fn aSchedule(_: *Object, b: ?*AsyncBlock, delay: u32) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = delay;
-    const block = b orelse return E_INVALIDARG;
-    if (block.internal[0] != 0) {
-        const provider: ProviderFn = @ptrFromInt(block.internal[0]);
-        const data = ProviderData{ .block = block, .buffer_size = 0, .buffer = null, .context = @ptrFromInt(block.context) };
-        const hr = provider(1, &data);
-        if (block.internal[1] != 2) complete(block, hr, 0);
-    } else if (block.internal[1] != 2) {
-        complete(block, S_OK, 0);
-    }
-    return S_OK;
-}
-fn aComplete(_: *Object, b: ?*AsyncBlock, hr: HRESULT, size: usize) callconv(.{ .x86_64_win = .{} }) void {
-    const block = b orelse return;
-    complete(block, hr, size);
-}
-fn aGetResult(_: *Object, b: ?*AsyncBlock, identity: ?*const anyopaque, size: usize, buffer: ?*anyopaque, used: ?*usize) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = identity;
-    const block = b orelse return E_INVALIDARG;
-    if (block.internal[1] != 2) return E_PENDING;
-    if (used) |u| u.* = block.internal[3];
-    if (buffer) |buf| {
-        if (size < block.internal[3]) return E_INVALIDARG;
-        if (block.internal[0] != 0) {
-            const provider: ProviderFn = @ptrFromInt(block.internal[0]);
-            const data = ProviderData{ .block = block, .buffer_size = size, .buffer = buf, .context = @ptrFromInt(block.context) };
-            return provider(2, &data);
-        }
-    }
-    return S_OK;
-}
-fn aCreate(_: *Object, work: u32, completion: u32, out: ?*?*anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    if (g_queue_count >= g_queues.len) return E_FAIL;
-    const q = &g_queues[g_queue_count];
-    g_queue_count += 1;
-    q.* = .{ .work_mode = work, .completion_mode = completion };
-    if (out) |o| o.* = @ptrCast(@constCast(q));
-    return S_OK;
-}
-fn aCreateComposite(_: *Object, work: ?*anyopaque, completion: ?*anyopaque, out: ?*?*anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = work;
-    _ = completion;
-    return aCreate(undefined, 0, 0, out);
-}
-fn aGetPort(_: *Object, q: ?*anyopaque, port: u32, out: ?*?*anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = port;
-    if (out) |o| o.* = q;
-    return S_OK;
-}
-fn aDuplicate(_: *Object, q: ?*anyopaque, out: ?*?*anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    if (out) |o| o.* = q;
-    return S_OK;
-}
-fn aDispatch(_: *Object, q: ?*anyopaque, port: u32, timeout: u32) callconv(.{ .x86_64_win = .{} }) bool {
-    _ = timeout;
-    var found: ?Task = null;
-    lockTasks();
-    var i: usize = 0;
-    while (i < g_task_count) : (i += 1) {
-        if (g_tasks[i].port == port and (q == null or @intFromPtr(g_tasks[i].queue) == @intFromPtr(q))) {
-            found = g_tasks[i];
-            var j = i;
-            while (j + 1 < g_task_count) : (j += 1) g_tasks[j] = g_tasks[j + 1];
-            g_task_count -= 1;
-            break;
-        }
-    }
-    unlockTasks();
-    if (found) |t| {
-        if (t.callback) |cb| cb(t.context, false);
-        return true;
-    }
-    return false;
-}
-fn aClose(_: *Object, q: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = q;
-}
-fn aSubmit(_: *Object, q: ?*anyopaque, port: u32, context: ?*anyopaque, callback: ?CallbackFn) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    enqueue(@ptrCast(@alignCast(q)), port, context, callback);
-    return S_OK;
-}
-fn aSubmitDelayed(_: *Object, q: ?*anyopaque, port: u32, delay: u32, context: ?*anyopaque, callback: ?CallbackFn) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = delay;
-    enqueue(@ptrCast(@alignCast(q)), port, context, callback);
-    return S_OK;
-}
-fn aTerminate(_: *Object, q: ?*anyopaque, wait: u8, context: ?*anyopaque, callback: ?CallbackFn) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = q;
-    _ = wait;
-    if (callback) |cb| cb(context, false);
-    return S_OK;
-}
-fn aRegisterMonitor(_: *Object, q: ?*anyopaque, context: ?*anyopaque, callback: ?*anyopaque, token: ?*u64) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = q;
-    _ = context;
-    _ = callback;
-    if (token) |t| t.* = 1;
-    return S_OK;
-}
-fn aUnregisterMonitor(_: *Object, q: ?*anyopaque, token: u64) callconv(.{ .x86_64_win = .{} }) void {
-    _ = q;
-    _ = token;
-}
-fn aGetProcessQueue(_: *Object, out: ?*?*anyopaque) callconv(.{ .x86_64_win = .{} }) bool {
-    if (out) |o| o.* = @ptrCast(@constCast(&g_queues[0]));
-    return true;
-}
-fn aSetProcessQueue(_: *Object, q: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = q;
-}
-
-var async_vtbl = [31]*const anyopaque{
-    @ptrCast(&qi), @ptrCast(&addRef), @ptrCast(&release),
-    @ptrCast(&aGetStatus), @ptrCast(&aGetResultSize), @ptrCast(&aCancel),
-    @ptrCast(&aRun), @ptrCast(&aBegin), @ptrCast(&missing),
-    @ptrCast(&aSchedule), @ptrCast(&aComplete), @ptrCast(&aGetResult),
-    @ptrCast(&aCreate), @ptrCast(&aCreateComposite), @ptrCast(&aGetPort),
-    @ptrCast(&aDuplicate), @ptrCast(&aDispatch), @ptrCast(&aClose),
-    @ptrCast(&aSubmit), @ptrCast(&aSubmitDelayed), @ptrCast(&missing),
-    @ptrCast(&missing), @ptrCast(&aTerminate), @ptrCast(&aRegisterMonitor),
-    @ptrCast(&aUnregisterMonitor), @ptrCast(&aGetProcessQueue), @ptrCast(&aSetProcessQueue),
-    @ptrCast(&missing), @ptrCast(&missing), @ptrCast(&missing), @ptrCast(&missing),
-};
-const async_obj = Object{ .lpVtbl = @ptrCast(&async_vtbl) };
 
 // ---------------------------------------------------------------------------
-// XPackage
+// GDK runtime version
+// ---------------------------------------------------------------------------
+
+pub const SUPPORTED_GDK_BUILD: u32 = 26100;
+pub const SUPPORTED_GDK_VERSION: u64 = 0x65f4_0000_1edd;
+pub const CO_E_NOTINITIALIZED: HRESULT = @bitCast(@as(u32, 0x8004_01F0));
+
+var g_gdk_version: u64 = 0;
+var g_gdk_build: u32 = 0;
+var g_gdk_initialized: bool = false;
+
+/// Accept only the GRDK build this HLE models (261000 / build 26100).
+/// Any other build fails closed; QueryApiImpl refuses to hand out providers
+/// until a supported InitializeApiImpl* call has happened.
+pub fn initialize(version: u64) HRESULT {
+    const build: u32 = @truncate(version >> 32);
+    if (build != SUPPORTED_GDK_BUILD) {
+        std.log.warn("[GDK] unsupported runtime version 0x{x} (build {d}); supported build {d}", .{
+            version, build, SUPPORTED_GDK_BUILD,
+        });
+        g_gdk_initialized = false;
+        g_gdk_build = 0;
+        g_gdk_version = 0;
+        return E_FAIL;
+    }
+    g_gdk_initialized = true;
+    g_gdk_build = build;
+    g_gdk_version = version;
+    std.log.info("[GDK] runtime initialized: version=0x{x} build={d}", .{ version, build });
+    return S_OK;
+}
+
+pub fn uninitialize() void {
+    g_gdk_initialized = false;
+    g_gdk_build = 0;
+    g_gdk_version = 0;
+}
+
+pub fn isInitialized() bool {
+    return g_gdk_initialized;
+}
+pub fn gdkBuild() u32 {
+    return g_gdk_build;
+}
+pub fn resetForTest() void {
+    uninitialize();
+}
+
+// ---------------------------------------------------------------------------
+// XPackage (261000 XPackage.h declaration order)
 // ---------------------------------------------------------------------------
 
 const Progress = extern struct { total: u64, installed: u64, launch: u64, launchable: bool, completed: bool };
+const WriteStats = extern struct { interval: u64, budget: u64, elapsed: u64, bytes_written: u64 };
+const Details = extern struct {
+    package_identifier: [*:0]const u8,
+    version: u64, // XVersion union (major, minor, build, revision)
+    kind: u32, // XPackageKind: Game=0
+    display_name: [*:0]const u8,
+    description: [*:0]const u8,
+    publisher: [*:0]const u8,
+    store_id: [*:0]const u8,
+    installing: bool,
+    index: u32,
+    count: u32,
+    age_restricted: bool,
+    title_id: [*:0]const u8,
+};
+
+const CURRENT_ID = "7952987A";
+const DISPLAY_NAME = "Grand Theft Auto VI";
+const PUBLISHER = "Rockstar Games";
+const STORE_ID = "9NL3WWNZLZZN";
+const TITLE_ID = "7952987A";
+const EMPTY = "";
+const LOCALE = "en-US";
+const X_VERSION_1_0_2_1: u64 = 0x0001_0002_0000_0001; // major=1, minor=0, build=2, revision=1
+const CHUNK_UNAVAILABLE: u32 = 3;
+
+const Mount = struct { path: [8]u8 };
+
+fn mountCreate() ?*Mount {
+    const m = std.heap.page_allocator.create(Mount) catch return null;
+    m.* = .{ .path = .{ 'G', ':', '\\', 0, 0, 0, 0, 0 } };
+    return m;
+}
+
+fn isCurrentId(id: ?[*:0]const u8) bool {
+    const text = id orelse return false;
+    return std.mem.eql(u8, std.mem.span(text), CURRENT_ID);
+}
+
 var g_monitor: u8 = 0;
 
 fn pCurrentId(_: *Object, size: usize, buffer: ?[*]u8) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    const id = "7952987A";
     const out = buffer orelse return E_INVALIDARG;
-    if (size <= id.len) return E_FAIL;
-    @memcpy(out[0..id.len], id);
-    out[id.len] = 0;
+    if (size <= CURRENT_ID.len) return E_FAIL;
+    @memcpy(out[0..CURRENT_ID.len], CURRENT_ID);
+    out[CURRENT_ID.len] = 0;
     return S_OK;
 }
 fn pPackaged(_: *Object) callconv(.{ .x86_64_win = .{} }) bool {
     return true;
 }
 fn pCreateMonitor(_: *Object, id: ?[*:0]const u8, count: u32, sel: ?*const anyopaque, ms: u32, q: ?*anyopaque, out: ?*?*const anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = id;
     _ = count;
     _ = sel;
     _ = ms;
     _ = q;
-    if (out) |o| o.* = &g_monitor;
+    if (!isCurrentId(id)) return E_INVALIDARG;
+    const o = out orelse return E_INVALIDARG;
+    o.* = &g_monitor;
     return S_OK;
 }
 fn pCloseMonitor(_: *Object, m: ?*const anyopaque) callconv(.{ .x86_64_win = .{} }) void {
@@ -316,100 +193,262 @@ fn pProgress(_: *Object, m: ?*const anyopaque, out: ?*Progress) callconv(.{ .x86
     _ = m;
     if (out) |o| o.* = .{ .total = 1, .installed = 1, .launch = 1, .launchable = true, .completed = true };
 }
-fn pRegisterProgress(_: *Object, m: ?*const anyopaque, ctx: ?*anyopaque, cb: ?*anyopaque, out: ?*u64) callconv(.{ .x86_64_win = .{} }) HRESULT {
+fn pUpdateMonitor(_: *Object, m: ?*const anyopaque) callconv(.{ .x86_64_win = .{} }) bool {
     _ = m;
-    _ = ctx;
-    _ = cb;
+    return true;
+}
+fn pRegisterProgress(_: *Object, m: ?*const anyopaque, ctx: ?*anyopaque, cb: ?*anyopaque, out: ?*u64) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    const callback = cb orelse return E_INVALIDARG;
+    const monitor = m orelse return E_INVALIDARG;
+    // Installation progress is already complete, so invoke the callback once
+    // instead of pretending a future notification exists.
+    const f: *const fn (?*anyopaque, ?*const anyopaque) callconv(.{ .x86_64_win = .{} }) void = @ptrCast(callback);
+    f(ctx, monitor);
     if (out) |o| o.* = 1;
     return S_OK;
 }
+fn pUnregisterProgress(_: *Object, m: ?*const anyopaque, token: u64, wait: bool) callconv(.{ .x86_64_win = .{} }) bool {
+    _ = m;
+    _ = token;
+    _ = wait;
+    return true;
+}
+fn pGetUserLocale(_: *Object, size: usize, buffer: ?[*]u8) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    const out = buffer orelse return E_INVALIDARG;
+    if (size < LOCALE.len + 1) return E_FAIL;
+    @memcpy(out[0..LOCALE.len], LOCALE);
+    out[LOCALE.len] = 0;
+    return S_OK;
+}
 fn pAvailability(_: *Object, id: ?[*:0]const u8, count: u32, sel: ?*const anyopaque, out: ?*u32) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = id;
     _ = count;
     _ = sel;
-    if (out) |o| o.* = 0;
+    const result = out orelse return E_INVALIDARG;
+    if (id == null) return E_INVALIDARG;
+    // The current game package is fully installed; no content package is
+    // known to this loader, so unknown identifiers are Unavailable.
+    result.* = if (isCurrentId(id)) 0 else CHUNK_UNAVAILABLE;
     return S_OK;
+}
+fn pEnumerateChunkAvailability(_: *Object, id: ?[*:0]const u8, typ: u32, ctx: ?*anyopaque, cb: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    _ = id;
+    _ = typ;
+    _ = ctx;
+    _ = cb;
+    // No chunk metadata is available; do not fake an enumeration.
+    return E_NOTIMPL;
 }
 fn pChangeOrder(_: *Object, id: ?[*:0]const u8, count: u32, sel: ?*const anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = id;
     _ = count;
     _ = sel;
+    if (!isCurrentId(id)) return NO_PACKAGE;
     return S_OK;
 }
-fn pInstallAsync(_: *Object, id: ?[*:0]const u8, count: u32, sel: ?*const anyopaque, ms: u32, suppress: bool, block: ?*AsyncBlock) callconv(.{ .x86_64_win = .{} }) HRESULT {
+fn pInstallChunks(_: *Object, id: ?[*:0]const u8, count: u32, sel: ?*const anyopaque, ms: u32, suppress: bool, out: ?*?*const anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
     _ = id;
     _ = count;
     _ = sel;
     _ = ms;
     _ = suppress;
-    if (block) |b| complete(b, S_OK, 0);
+    _ = out;
+    // No content installation support.
+    return E_NOTIMPL;
+}
+fn pInstallAsync(_: *Object, id: ?[*:0]const u8, count: u32, sel: ?*const anyopaque, ms: u32, suppress: bool, block: ?*AsyncBlock) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    _ = count;
+    _ = sel;
+    _ = ms;
+    _ = suppress;
+    const b = block orelse return E_INVALIDARG;
+    if (isCurrentId(id)) {
+        complete(b, S_OK, 0);
+    } else {
+        complete(b, NO_PACKAGE, 0);
+    }
     return S_OK;
 }
 fn pInstallResult(_: *Object, block: ?*AsyncBlock, out: ?*?*const anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = block;
-    if (out) |o| o.* = &g_monitor;
-    return S_OK;
+    const b = block orelse return E_INVALIDARG;
+    const hr: HRESULT = @bitCast(@as(u32, @truncate(b.internal[2])));
+    if (out) |o| o.* = if (hr == S_OK) &g_monitor else null;
+    return hr;
 }
 fn pEstimate(_: *Object, id: ?[*:0]const u8, count: u32, sel: ?*const anyopaque, bytes: ?*u64, confirm: ?*bool) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = id;
     _ = count;
     _ = sel;
+    if (!isCurrentId(id)) return NO_PACKAGE;
     if (bytes) |b| b.* = 0;
     if (confirm) |c| c.* = false;
     return S_OK;
 }
 fn pUninstall(_: *Object, id: ?[*:0]const u8, count: u32, sel: ?*const anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = id;
     _ = count;
     _ = sel;
+    if (id == null) return E_INVALIDARG;
+    return if (isCurrentId(id)) E_NOTIMPL else NO_PACKAGE;
+}
+
+const EnumCallback = *const fn (?*anyopaque, *const Details) callconv(.{ .x86_64_win = .{} }) bool;
+
+fn pEnumerate(_: *Object, kind: u32, scope: u32, ctx: ?*anyopaque, cb: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    _ = scope;
+    if (cb == null) return E_INVALIDARG;
+    // XPackageKind.Game == 0.  Content/PublisherContent have no additional
+    // packages in this install, so a successful empty enumeration is truthful.
+    if (kind != 0) return S_OK;
+    var details = Details{
+        .package_identifier = CURRENT_ID,
+        .version = X_VERSION_1_0_2_1,
+        .kind = 0,
+        .display_name = DISPLAY_NAME,
+        .description = EMPTY,
+        .publisher = PUBLISHER,
+        .store_id = STORE_ID,
+        .installing = false,
+        .index = 0,
+        .count = 1,
+        .age_restricted = false,
+        .title_id = TITLE_ID,
+    };
+    const callback: EnumCallback = @ptrCast(cb.?);
+    return if (callback(ctx, &details)) S_OK else E_ABORT;
+}
+fn pGetPackageKind(_: *Object, id: ?[*:0]const u8, out: ?*u32) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    const result = out orelse return E_INVALIDARG;
+    if (!isCurrentId(id)) return E_INVALIDARG;
+    result.* = 0; // XPackageKind.Game
+    return S_OK;
+}
+fn pRegisterPackageInstalled(_: *Object, q: ?*anyopaque, ctx: ?*anyopaque, cb: ?*anyopaque, token: ?*u64) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    _ = q;
+    _ = ctx;
+    _ = cb;
+    if (token) |t| t.* = 0;
     return E_NOTIMPL;
 }
+fn pUnregisterPackageInstalled(_: *Object, token: u64, wait: bool) callconv(.{ .x86_64_win = .{} }) bool {
+    _ = token;
+    _ = wait;
+    return false;
+}
+fn pEnumerateFeatures(_: *Object, id: ?[*:0]const u8, ctx: ?*anyopaque, cb: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    _ = id;
+    _ = ctx;
+    _ = cb;
+    // No features are declared by this package.
+    return S_OK;
+}
+fn pMount(_: *Object, id: ?[*:0]const u8, out: ?*?*const anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    const result = out orelse return E_INVALIDARG;
+    result.* = null;
+    if (!isCurrentId(id)) return NO_PACKAGE;
+    const mount = mountCreate() orelse return E_OUTOFMEMORY;
+    result.* = mount;
+    return S_OK;
+}
+fn pMountAsync(_: *Object, id: ?[*:0]const u8, block: ?*AsyncBlock) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    const b = block orelse return E_INVALIDARG;
+    if (!isCurrentId(id)) {
+        complete(b, NO_PACKAGE, 0);
+        return S_OK;
+    }
+    const mount = mountCreate() orelse {
+        complete(b, E_OUTOFMEMORY, 0);
+        return S_OK;
+    };
+    complete(b, S_OK, @intFromPtr(mount));
+    return S_OK;
+}
+fn pMountResult(_: *Object, block: ?*AsyncBlock, out: ?*?*const anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    const b = block orelse return E_INVALIDARG;
+    const hr: HRESULT = @bitCast(@as(u32, @truncate(b.internal[2])));
+    if (hr != S_OK) {
+        if (out) |o| o.* = null;
+        return hr;
+    }
+    const ptr = b.internal[3];
+    if (ptr == 0) {
+        if (out) |o| o.* = null;
+        return E_FAIL;
+    }
+    if (out) |o| o.* = @ptrFromInt(ptr);
+    return S_OK;
+}
+fn pMountPathSize(_: *Object, m: ?*const anyopaque, size: ?*usize) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    if (m == null) return E_INVALIDARG;
+    const out = size orelse return E_INVALIDARG;
+    out.* = "G:\\".len + 1;
+    return S_OK;
+}
 fn pMountPath(_: *Object, m: ?*const anyopaque, size: usize, buf: ?[*]u8) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = m;
-    _ = size;
-    _ = buf;
-    return E_INVALIDARG;
+    if (m == null) return E_INVALIDARG;
+    const out = buf orelse return E_INVALIDARG;
+    const path = "G:\\";
+    if (size < path.len + 1) return E_FAIL;
+    @memcpy(out[0..path.len], path);
+    out[path.len] = 0;
+    return S_OK;
 }
 fn pCloseMount(_: *Object, m: ?*const anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = m;
+    const mount: *Mount = @ptrCast(@alignCast(@constCast(m orelse return)));
+    std.heap.page_allocator.destroy(mount);
+}
+fn pGetWriteStats(_: *Object, out: ?*WriteStats) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    if (out) |o| o.* = .{ .interval = 0, .budget = 0, .elapsed = 0, .bytes_written = 0 };
+    return S_OK;
+}
+fn pUninstallUWPInstance(_: *Object, name: ?[*:0]const u8) callconv(.{ .x86_64_win = .{} }) HRESULT {
+    _ = name;
+    return E_NOTIMPL;
 }
 fn pUninstallPackage(_: *Object, id: ?[*:0]const u8) callconv(.{ .x86_64_win = .{} }) bool {
     _ = id;
     return false;
 }
-fn pMountAsync(_: *Object, id: ?[*:0]const u8, block: ?*AsyncBlock) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = id;
-    if (block) |b| complete(b, NO_PACKAGE, 0);
-    return S_OK;
-}
-fn pMountResult(_: *Object, block: ?*AsyncBlock, out: ?*?*const anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = block;
-    if (out) |o| o.* = &g_monitor;
-    return S_OK;
-}
-fn pEnumerate(_: *Object, kind: u32, scope: u32, ctx: ?*anyopaque, cb: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) HRESULT {
-    _ = kind;
-    _ = scope;
-    _ = ctx;
-    _ = cb;
-    return S_OK;
-}
 
-var package_vtbl = [40]*const anyopaque{
-    @ptrCast(&qi), @ptrCast(&addRef), @ptrCast(&release),
-    @ptrCast(&pCurrentId), @ptrCast(&pPackaged), @ptrCast(&pCreateMonitor),
-    @ptrCast(&pCloseMonitor), @ptrCast(&pProgress), @ptrCast(&missing),
-    @ptrCast(&pRegisterProgress), @ptrCast(&missing), @ptrCast(&missing),
-    @ptrCast(&pAvailability), @ptrCast(&missing), @ptrCast(&pChangeOrder),
-    @ptrCast(&missing), @ptrCast(&pInstallAsync), @ptrCast(&pInstallResult),
-    @ptrCast(&pEstimate), @ptrCast(&pUninstall), @ptrCast(&missing),
-    @ptrCast(&missing), @ptrCast(&missing), @ptrCast(&missing),
-    @ptrCast(&missing), @ptrCast(&pMountPath), @ptrCast(&pCloseMount),
-    @ptrCast(&missing), @ptrCast(&missing), @ptrCast(&missing),
-    @ptrCast(&missing), @ptrCast(&missing), @ptrCast(&missing),
-    @ptrCast(&missing), @ptrCast(&pUninstallPackage), @ptrCast(&missing),
-    @ptrCast(&missing), @ptrCast(&pMountAsync), @ptrCast(&pMountResult),
-    @ptrCast(&pEnumerate),
+// 64 slots: [0..2] IUnknown, [3..33] the 31 XPackage.h methods in declaration
+// order, [34..63] fail-closed padding so an unexpected slot cannot run off the
+// end of the table.
+var package_vtbl = blk: {
+    var table: [64]*const anyopaque = @splat(@ptrCast(&missing));
+    const methods = [_]*const anyopaque{
+        @ptrCast(&pCurrentId), // 1 GetCurrentProcessPackageIdentifier
+        @ptrCast(&pPackaged), // 2 IsPackagedProcess
+        @ptrCast(&pCreateMonitor), // 3 CreateInstallationMonitor
+        @ptrCast(&pCloseMonitor), // 4 CloseInstallationMonitorHandle
+        @ptrCast(&pProgress), // 5 GetInstallationProgress
+        @ptrCast(&pUpdateMonitor), // 6 UpdateInstallationMonitor
+        @ptrCast(&pRegisterProgress), // 7 RegisterInstallationProgressChanged
+        @ptrCast(&pUnregisterProgress), // 8 UnregisterInstallationProgressChanged
+        @ptrCast(&pGetUserLocale), // 9 GetUserLocale
+        @ptrCast(&pAvailability), // 10 FindChunkAvailability
+        @ptrCast(&pEnumerateChunkAvailability), // 11 EnumerateChunkAvailability
+        @ptrCast(&pChangeOrder), // 12 ChangeChunkInstallOrder
+        @ptrCast(&pInstallChunks), // 13 InstallChunks
+        @ptrCast(&pInstallAsync), // 14 InstallChunksAsync
+        @ptrCast(&pInstallResult), // 15 InstallChunksResult
+        @ptrCast(&pEstimate), // 16 EstimateDownloadSize
+        @ptrCast(&pUninstall), // 17 UninstallChunks
+        @ptrCast(&pEnumerate), // 18 EnumeratePackages
+        @ptrCast(&pGetPackageKind), // 19 GetPackageKind
+        @ptrCast(&pRegisterPackageInstalled), // 20 RegisterPackageInstalled
+        @ptrCast(&pUnregisterPackageInstalled), // 21 UnregisterPackageInstalled
+        @ptrCast(&pEnumerateFeatures), // 22 EnumerateFeatures
+        @ptrCast(&pMount), // 23 Mount (deprecated)
+        @ptrCast(&pMountAsync), // 24 MountWithUiAsync
+        @ptrCast(&pMountResult), // 25 MountWithUiResult
+        @ptrCast(&pMountPathSize), // 26 GetMountPathSize
+        @ptrCast(&pMountPath), // 27 GetMountPath
+        @ptrCast(&pCloseMount), // 28 CloseMountHandle
+        @ptrCast(&pGetWriteStats), // 29 GetWriteStats
+        @ptrCast(&pUninstallUWPInstance), // 30 UninstallUWPInstance
+        @ptrCast(&pUninstallPackage), // 31 UninstallPackage
+    };
+    table[0] = @ptrCast(&qi);
+    table[1] = @ptrCast(&addRef);
+    table[2] = @ptrCast(&release);
+    @memcpy(table[3..34], &methods);
+    break :blk table;
 };
 const package_obj = Object{ .lpVtbl = @ptrCast(&package_vtbl) };
 
@@ -447,23 +486,39 @@ fn sPromptResult(_: *Object, block: ?*AsyncBlock) callconv(.{ .x86_64_win = .{} 
 }
 
 var storage_vtbl = [8]*const anyopaque{
-    @ptrCast(&qi), @ptrCast(&addRef), @ptrCast(&release),
-    @ptrCast(&sPathSize), @ptrCast(&sPath), @ptrCast(&sSpace),
-    @ptrCast(&sPrompt), @ptrCast(&sPromptResult),
+    @ptrCast(&qi),        @ptrCast(&addRef),        @ptrCast(&release),
+    @ptrCast(&sPathSize), @ptrCast(&sPath),         @ptrCast(&sSpace),
+    @ptrCast(&sPrompt),   @ptrCast(&sPromptResult),
 };
 const storage_obj = Object{ .lpVtbl = @ptrCast(&storage_vtbl) };
+
+fn isIUnknown(g: *const Guid) bool {
+    return g.d1 == 0 and g.d2 == 0 and g.d3 == 0 and
+        std.mem.eql(u8, &g.d4, &[_]u8{ 0xC0, 0, 0, 0, 0, 0, 0, 0x46 });
+}
+
+fn riidMatches(riid: ?*const Guid, expected: *const Guid) bool {
+    const r = riid orelse return false;
+    if (isIUnknown(r)) return true;
+    return eqGuid(r, expected.d1, expected.d2, expected.d3, expected.d4);
+}
 
 pub fn queryApi(clsid: ?*const Guid, riid: ?*const Guid, ppv: ?*?*anyopaque) ?HRESULT {
     const c = clsid orelse return null;
     if (ppv) |out| out.* = null;
-    if (eqGuid(c, XASYNC.d1, XASYNC.d2, XASYNC.d3, XASYNC.d4)) return null;
+    if (eqGuid(c, XASYNC.d1, XASYNC.d2, XASYNC.d3, XASYNC.d4)) {
+        // No XAsync provider object is implemented; the flat XAsync APIs are
+        // not claimed either.  Report the truth instead of handing out a
+        // guessed vtable.
+        return E_NOINTERFACE;
+    }
     if (eqGuid(c, XPACKAGE.d1, XPACKAGE.d2, XPACKAGE.d3, XPACKAGE.d4)) {
-        _ = riid;
+        if (!riidMatches(riid, &XPACKAGE_IID)) return E_NOINTERFACE;
         if (ppv) |out| out.* = @ptrCast(@constCast(&package_obj));
         return S_OK;
     }
     if (eqGuid(c, STORAGE.d1, STORAGE.d2, STORAGE.d3, STORAGE.d4)) {
-        _ = riid;
+        if (!riidMatches(riid, &STORAGE_IID)) return E_NOINTERFACE;
         if (ppv) |out| out.* = @ptrCast(@constCast(&storage_obj));
         return S_OK;
     }

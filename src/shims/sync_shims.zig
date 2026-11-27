@@ -119,8 +119,15 @@ fn shim_CloseHandle(handle: usize) callconv(win) i32 {
 }
 
 fn shim_GetExitCodeThread(handle: usize, out: ?*u32) callconv(win) i32 {
-    const p = out orelse return 0;
-    return if (sync.getExitCodeThread(handle, p)) 1 else 0;
+    const p = out orelse {
+        teb.setLastError(sync.ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if (!sync.getExitCodeThread(handle, p)) {
+        teb.setLastError(sync.ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    return 1;
 }
 
 fn shim_InitializeCriticalSection(cs: ?*anyopaque) callconv(win) void {

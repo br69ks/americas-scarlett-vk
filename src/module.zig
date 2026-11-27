@@ -21,7 +21,11 @@ pub const Export = struct {
 
 pub const Module = struct {
     name: []const u8, // lower-case base name, e.g. "msvcp140.dll"
+    /// Host path (internal: loader search, diagnostics); never guest-visible.
     path: []const u8,
+    /// Guest-visible module path (e.g. `G:\ucrtbase.dll`) reported through the
+    /// PEB Ldr list and GetModuleFileName.
+    virtual_path: []const u8,
     base: usize,
     size: usize,
     entry: usize,
@@ -83,6 +87,7 @@ fn lowerDupe(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
 pub fn register(
     allocator: std.mem.Allocator,
     path: []const u8,
+    virtual_path: []const u8,
     display_name: []const u8,
     base: usize,
     size: usize,
@@ -96,6 +101,7 @@ pub fn register(
     m.* = .{
         .name = try lowerDupe(allocator, display_name),
         .path = try allocator.dupe(u8, path),
+        .virtual_path = try allocator.dupe(u8, virtual_path),
         .base = base,
         .size = size,
         .entry = entry,
@@ -106,14 +112,54 @@ pub fn register(
     };
 
     if (teb.process() != null) {
-        m.ldr = try teb.addLdrEntry(allocator, base, entry, size, path, display_name);
+        m.ldr = try teb.addLdrEntry(allocator, base, entry, size, virtual_path, display_name);
     }
 
     g_lock.lock();
     defer g_lock.unlock();
     try g_modules.append(allocator, m);
+    publishImageInfo(base, size, pdata_base, pdata_count);
     if (is_exe) teb.setImageBase(base);
     return m;
+}
+
+/// Minimal image description for lock-free PC -> image lookup.
+pub const ImageInfo = extern struct {
+    base: usize,
+    end: usize,
+    pdata_base: usize,
+    pdata_count: usize,
+};
+
+pub const MAX_IMAGE_INFO = 256;
+var g_image_info: [MAX_IMAGE_INFO]ImageInfo = undefined;
+var g_image_count = std.atomic.Value(usize).init(0);
+
+/// Publish an image range.  Called with `g_lock` held, so writers are
+/// serialized; readers never take the lock.
+fn publishImageInfo(base: usize, size: usize, pdata_base: usize, pdata_count: usize) void {
+    const idx = g_image_count.load(.monotonic);
+    if (idx >= MAX_IMAGE_INFO) return;
+    g_image_info[idx] = .{
+        .base = base,
+        .end = base + size,
+        .pdata_base = pdata_base,
+        .pdata_count = pdata_count,
+    };
+    g_image_count.store(idx + 1, .release);
+}
+
+/// Lock-free "which loaded image contains this PC".  The x64 exception
+/// dispatcher (and the Linux signal handler, which may interrupt a thread that
+/// holds `g_lock`) must not take the module spinlock to answer this.
+pub fn findImageInfo(addr: usize) ?*const ImageInfo {
+    const n = g_image_count.load(.acquire);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        const e = &g_image_info[i];
+        if (addr >= e.base and addr < e.end) return e;
+    }
+    return null;
 }
 
 pub fn findByName(name: []const u8) ?*Module {
@@ -210,8 +256,8 @@ pub fn fileNameA(base: usize, out: [*]u8, cap: usize) usize {
         out[0] = 0;
         return 0;
     };
-    const n = @min(m.path.len, cap - 1);
-    @memcpy(out[0..n], m.path[0..n]);
+    const n = @min(m.virtual_path.len, cap - 1);
+    @memcpy(out[0..n], m.virtual_path[0..n]);
     out[n] = 0;
     return n;
 }

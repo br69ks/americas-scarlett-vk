@@ -6,6 +6,9 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "americas-loader",
+        // The SEH entry points contain x86-64 asm that the self-hosted debug
+        // backend's assembler cannot encode (symbol calls, memory operands).
+        .use_llvm = true,
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
                                       .target = target,
@@ -22,7 +25,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    const tests = b.addTest(.{ .root_module = test_mod });
+    const tests = b.addTest(.{ .root_module = test_mod, .use_llvm = true });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);

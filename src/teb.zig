@@ -7,10 +7,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const loader_lock = @import("loader_lock.zig");
 const Allocator = std.mem.Allocator;
 
 pub const MAX_TLS_SLOTS = 64;
-pub const TEB_SIZE = 0x1800;
+/// Size of the Windows 10/11 x64 TEB (0x1838) rounded up.  The UCRT writes
+/// `ReservedForCrt` at 0x1820, past the 64 inline TlsSlots.
+pub const TEB_SIZE = 0x1840;
 
 pub const OFF = struct {
     pub const exception_list = 0x00;
@@ -23,6 +26,11 @@ pub const OFF = struct {
     pub const peb = 0x60;
     pub const last_error = 0x68;
     pub const tls_slots = 0x1480;
+    /// `ReservedForCrt`.  On Windows 10+ the UCRT's `__crt_state_management`
+    /// stores the current per-thread global-state index here (0 = normal,
+    /// 1 = inside an OS call); it only falls back to an FLS slot when the OS
+    /// version check reports pre-Windows-10.
+    pub const reserved_for_crt = 0x1820;
 };
 
 /// x64 TEB prefix.  The field names follow the Wine/ReactOS layout; offsets
@@ -49,6 +57,9 @@ pub const TEB = extern struct {
     count_of_owned_critical_sections: u32,
     _pad: [0x1480 - 0x70]u8,
     tls_slots: [MAX_TLS_SLOTS]usize,
+    _pad2: [OFF.reserved_for_crt - 0x1680]u8,
+    /// UCRT-owned slot; the loader never writes it (see OFF.reserved_for_crt).
+    reserved_for_crt: usize,
 };
 
 pub const UNICODE_STRING = extern struct {
@@ -172,6 +183,7 @@ comptime {
     std.debug.assert(@offsetOf(TEB, "thread_local_storage_pointer") == 0x58);
     std.debug.assert(@offsetOf(TEB, "process_environment_block") == 0x60);
     std.debug.assert(@offsetOf(TEB, "tls_slots") == 0x1480);
+    std.debug.assert(@offsetOf(TEB, "reserved_for_crt") == 0x1820);
     std.debug.assert(@offsetOf(PEB, "ImageBaseAddress") == 0x10);
     std.debug.assert(@offsetOf(PEB, "Ldr") == 0x18);
     std.debug.assert(@offsetOf(PEB, "ProcessParameters") == 0x20);
@@ -202,6 +214,12 @@ pub const Process = struct {
     tls_template_sizes: [MAX_TLS_SLOTS]u32 = @splat(0),
     tls_template_len: usize = 0,
     host_teb: usize = 0,
+    /// Real host stack bounds of the main thread (used to clamp guest limits).
+    main_stack_base: usize = 0,
+    main_stack_limit: usize = 0,
+    /// Guest stack sizes from the executable's PE optional header.
+    stack_reserve: usize = 0,
+    stack_commit: usize = 0,
 };
 
 var g_process: ?*Process = null;
@@ -214,18 +232,25 @@ pub fn process() ?*Process {
 
 fn readHostTeb() usize {
     var p: usize = 0;
-    asm volatile ("movq %%gs:0x30, %[out]" : [out] "=r" (p));
+    asm volatile ("movq %%gs:0x30, %[out]"
+        : [out] "=r" (p),
+    );
     return p;
 }
 
 fn setGsBase(base: usize) void {
-    asm volatile ("wrgsbase %[base]" :: [base] "r" (base));
+    asm volatile ("wrgsbase %[base]"
+        :
+        : [base] "r" (base),
+    );
 }
 
 pub fn currentTeb() ?*TEB {
     if (builtin.os.tag == .windows) {
         var p: usize = 0;
-        asm volatile ("movq %%gs:0x30, %[out]" : [out] "=r" (p));
+        asm volatile ("movq %%gs:0x30, %[out]"
+            : [out] "=r" (p),
+        );
         if (p >= 0x10000) return @ptrFromInt(p);
         if (g_process) |proc| return proc.teb_ptr;
         return null;
@@ -241,6 +266,14 @@ pub fn currentTeb() ?*TEB {
     return @ptrFromInt(p);
 }
 
+/// Guest stack bounds for the current thread (TEB NT_TIB StackBase/StackLimit).
+pub const StackBounds = struct { base: usize, limit: usize };
+
+pub fn stackBounds() ?StackBounds {
+    const t = currentTeb() orelse return null;
+    return .{ .base = t.nt_tib.stack_base, .limit = t.nt_tib.stack_limit };
+}
+
 pub var g_entry_gs: usize = 0;
 pub var g_guest_teb: usize = 0;
 pub var g_enter_count: usize = 0;
@@ -248,24 +281,47 @@ pub var g_leave_count: usize = 0;
 pub var g_leave_trace: [8]usize = @splat(0);
 pub var g_enter_trace: [8]usize = @splat(0);
 
+/// Guest TEB installed for the current host thread on Linux.  Each guest
+/// thread has its own TEB (own TLS slots and stack bounds), so the loader must
+/// never substitute the process's main TEB for it.
+threadlocal var tls_guest_teb: usize = 0;
+
 pub fn readGsBase() usize {
     var p: usize = 0;
-    if (builtin.os.tag == .windows) asm volatile ("rdgsbase %[out]" : [out] "=r" (p));
+    if (builtin.os.tag == .windows) asm volatile ("rdgsbase %[out]"
+        : [out] "=r" (p),
+    );
     return p;
 }
 
 pub fn testGsBase(target: usize) usize {
     if (builtin.os.tag != .windows) return 0;
     var orig: usize = 0;
-    asm volatile ("rdgsbase %[out]" : [out] "=r" (orig));
+    asm volatile ("rdgsbase %[out]"
+        : [out] "=r" (orig),
+    );
     setGsBase(target);
     var got: usize = 0;
-    asm volatile ("rdgsbase %[out]" : [out] "=r" (got));
+    asm volatile ("rdgsbase %[out]"
+        : [out] "=r" (got),
+    );
     setGsBase(orig);
     return got;
 }
 
 pub fn enterGuest() void {
+    if (builtin.os.tag == .linux) {
+        // Linux never switches to a host TEB, so this only needs to reinstall
+        // *this thread's* guest TEB (never the process's main TEB).
+        const target = if (tls_guest_teb >= 0x10000)
+            tls_guest_teb
+        else if (g_process) |p| @intFromPtr(p.teb_ptr) else 0;
+        if (target >= 0x10000) {
+            const ARCH_SET_GS: usize = 0x1001;
+            _ = std.os.linux.syscall2(.arch_prctl, ARCH_SET_GS, target);
+        }
+        return;
+    }
     if (builtin.os.tag != .windows) return;
     const guest = if (g_process) |p| p.teb_ptr else (currentTeb() orelse return);
     g_guest_teb = @intFromPtr(guest);
@@ -294,43 +350,37 @@ pub fn forceGuest() void {
     }
 }
 
-pub fn enterHost() void {
-    if (builtin.os.tag != .windows) return;
-    if (readGsBase() != g_guest_teb) return;
-    if (g_guest_teb == 0) return;
-    const guest: *TEB = @ptrFromInt(g_guest_teb);
-    const host = @as(*const usize, @ptrFromInt(@intFromPtr(guest) + 0x1FF8)).*;
-    if (host >= 0x10000) setGsBase(host);
-}
-
-pub fn leaveHost() void {
-    if (builtin.os.tag != .windows) return;
-    if (g_guest_teb >= 0x10000) setGsBase(g_guest_teb);
-}
-
-pub fn restoreGs() callconv(.c) void {
-    if (builtin.os.tag != .windows) return;
-    if (g_guest_teb >= 0x10000) {
-        asm volatile ("wrgsbase %[base]" :: [base] "r" (g_guest_teb));
-    }
-}
-
 pub fn leaveGuest() void {
     if (builtin.os.tag != .windows) return;
     g_leave_count += 1;
     const ra = @returnAddress();
     g_leave_trace[g_leave_count % 8] = ra;
     var host: usize = 0;
-    asm volatile ("movq %%gs:0x1FF8, %[out]" : [out] "=r" (host));
+    asm volatile ("movq %%gs:0x1FF8, %[out]"
+        : [out] "=r" (host),
+    );
     if (host >= 0x10000) setGsBase(host);
 }
+
+/// Guest TEB for this thread without reading %gs.  Safe to call from a signal
+/// handler, where the GS base may not be installed (loader-internal threads).
+pub fn threadTeb() ?*TEB {
+    if (tls_guest_teb >= 0x10000) return @ptrFromInt(tls_guest_teb);
+    return null;
+}
+
+/// Optional per-thread hook run once the guest TEB/GS state is installed.
+/// Used by the Linux backend to install a per-thread signal alternate stack.
+pub var thread_init_hook: ?*const fn () void = null;
 
 /// Guest TEB for this thread even while a host thunk has switched GS.
 /// Host thunks maintain host TEB+0x28 = guest TEB and host TEB+0x1FF8 = 0.
 fn guestTeb() ?*TEB {
     if (builtin.os.tag != .windows) return currentTeb();
     var p: usize = 0;
-    asm volatile ("movq %%gs:0x30, %[out]" : [out] "=r" (p));
+    asm volatile ("movq %%gs:0x30, %[out]"
+        : [out] "=r" (p),
+    );
     if (p < 0x10000) {
         if (g_process) |proc| return proc.teb_ptr;
         return null;
@@ -474,7 +524,9 @@ pub fn mainStackBounds() struct { base: usize, limit: usize } {
     }
     // Fallback: current RSP and the process stack rlimit (usually 8 MiB).
     var rsp: usize = undefined;
-    asm volatile ("movq %%rsp, %[out]" : [out] "=r" (rsp));
+    asm volatile ("movq %%rsp, %[out]"
+        : [out] "=r" (rsp),
+    );
     return .{ .base = rsp, .limit = rsp - 8 * 1024 * 1024 };
 }
 
@@ -553,7 +605,9 @@ pub fn initProcess(
     const cwd_w = try makeWZ(allocator, cwd_with_sep);
     const env = try buildEnvironment(allocator, environ_map);
 
-    const dll_path_a = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ game_dir, std.fs.path.sep, "" });
+    // Guest-visible DLL search path: the synthetic G: drive (the host game
+    // directory stays internal to the loader).
+    const dll_path_a = try allocator.dupe(u8, "G:\\");
     defer allocator.free(dll_path_a);
     const dll_path_w = try makeWZ(allocator, dll_path_a);
 
@@ -624,16 +678,13 @@ pub fn initProcess(
         .game_dir = try allocator.dupe(u8, game_dir),
         .pid = pid,
         .tid = tid,
+        .main_stack_base = bounds.base,
+        .main_stack_limit = bounds.limit,
     };
     g_process = p;
-
-    // Slot 0 is the CRT per-thread data (PTD), not a module TLS template.
-    const crt_tls = try allocator.alloc(u8, 0x10000);
-    @memset(crt_tls, 0);
-    p.tls_template[0] = @intFromPtr(crt_tls.ptr);
-    p.tls_template_sizes[0] = 0x10000;
-    p.tls_template_len = 1;
-    module_tls[0] = @intFromPtr(crt_tls.ptr);
+    // The main thread's TEB participates in late-loaded module TLS updates but
+    // is never freed by releaseCurrentThread.
+    _ = registerTebRecord(teb, false);
 
     if (builtin.os.tag == .windows) {
         const host = readHostTeb();
@@ -648,9 +699,42 @@ pub fn initProcess(
         const ARCH_SET_GS: usize = 0x1001;
         const rc = std.os.linux.syscall2(.arch_prctl, ARCH_SET_GS, @intFromPtr(teb));
         if (@as(isize, @bitCast(rc)) != 0) return error.ArchPrctlFailed;
+        tls_guest_teb = @intFromPtr(teb);
     }
 
     return p;
+}
+
+/// Apply the executable's PE stack sizes: the main guest thread's StackLimit
+/// becomes `StackBase - SizeOfStackReserve` (clamped to the real host stack),
+/// and `CreateThread(0)` uses the same reserve as the process default.
+pub fn setProcessStackSizes(reserve: u64, commit: u64) void {
+    const p = g_process orelse return;
+    p.stack_reserve = std.math.cast(usize, reserve) orelse 0;
+    p.stack_commit = std.math.cast(usize, commit) orelse 0;
+    if (p.stack_reserve < 64 * 1024) return;
+    const t = p.teb_ptr;
+    const base = t.nt_tib.stack_base;
+    if (base == 0) return;
+    t.nt_tib.stack_limit = guestStackLimit(base, p.stack_reserve, p.main_stack_limit);
+}
+
+/// Guest StackLimit for a given StackBase and PE stack reserve.  The limit is
+/// clamped to the real host stack so a guest probe can never run off the host
+/// mapping.
+pub fn guestStackLimit(base: usize, reserve: usize, host_limit: usize) usize {
+    if (reserve < 64 * 1024 or base == 0) return host_limit;
+    var limit = if (base > reserve) base - reserve else 0;
+    if (host_limit != 0 and limit < host_limit) limit = host_limit;
+    return limit;
+}
+
+/// Default stack reserve for `CreateThread(0)` (PE SizeOfStackReserve).
+pub fn processStackReserve() usize {
+    if (g_process) |p| {
+        if (p.stack_reserve >= 64 * 1024) return @min(p.stack_reserve, 64 * 1024 * 1024);
+    }
+    return 1024 * 1024;
 }
 
 pub fn initThread(stack_base: usize, stack_limit: usize, tid: u32) !*TEB {
@@ -661,7 +745,11 @@ pub fn initThread(stack_base: usize, stack_limit: usize, tid: u32) !*TEB {
 
     const tls_mem = try std.heap.page_allocator.alloc(usize, MAX_TLS_SLOTS);
     @memset(tls_mem, 0);
-    for (0..p.tls_template_len) |i| {
+    // Snapshot the published TLS templates under the loader lock: a concurrent
+    // module load publishes slots atomically with this copy.
+    loader_lock.lock();
+    defer loader_lock.unlock();
+    for (0..MAX_TLS_SLOTS) |i| {
         tls_mem[i] = cloneTlsBlock(p.tls_template[i], p.tls_template_sizes[i]);
     }
 
@@ -678,6 +766,7 @@ pub fn initThread(stack_base: usize, stack_limit: usize, tid: u32) !*TEB {
         const ARCH_SET_GS: usize = 0x1001;
         const rc = std.os.linux.syscall2(.arch_prctl, ARCH_SET_GS, @intFromPtr(teb));
         if (@as(isize, @bitCast(rc)) != 0) return error.ArchPrctlFailed;
+        tls_guest_teb = @intFromPtr(teb);
     } else if (builtin.os.tag == .windows) {
         const host = readHostTeb();
         if (host != 0) {
@@ -686,6 +775,14 @@ pub fn initThread(stack_base: usize, stack_limit: usize, tid: u32) !*TEB {
             @as(*usize, @ptrFromInt(host + 0x28)).* = @intFromPtr(teb);
         }
     }
+    // Register for late-loaded module TLS publication and remember which TLS
+    // blocks this thread owns (the clones made above).
+    if (registerTebRecord(teb, true)) |rec| {
+        for (0..MAX_TLS_SLOTS) |i| {
+            if (tls_mem[i] != 0 and tls_mem[i] != p.tls_template[i]) rec.owned_tls[i] = tls_mem[i];
+        }
+    }
+    if (thread_init_hook) |hook| hook();
     return teb;
 }
 
@@ -699,43 +796,38 @@ fn cloneTlsBlock(template: usize, size: usize) usize {
 
 /// Assign the next per-module TLS index and publish the block for future
 /// threads.  The current thread is updated too.
+///
+/// Image TLS indexes, `TlsAlloc` and `FlsAlloc` all take their index from the
+/// same guest TEB `TlsSlots` array (as they do on Windows), so they must be
+/// allocated through `tlsAlloc` -- handing out indexes from two independent
+/// counters makes e.g. a UCRT FLS slot alias a module's TLS block.
 pub fn allocModuleTls(block: usize, block_size: usize) !u16 {
     const p = g_process orelse return error.ProcessNotInitialized;
-    if (p.tls_template_len >= MAX_TLS_SLOTS) return error.TlsSlotsExhausted;
+    loader_lock.lock();
+    defer loader_lock.unlock();
     if (builtin.os.tag == .windows) {
         // Guest TLS indexes are image TLS indexes, not host tlsAlloc slots.
+        if (p.tls_template_len >= MAX_TLS_SLOTS) return error.TlsSlotsExhausted;
         const index: u16 = @intCast(p.tls_template_len);
-        p.tls_template_len += 1;
-        p.tls_template[index] = block;
-        p.tls_template_sizes[index] = @intCast(block_size);
-        const t: *TEB = p.teb_ptr;
-        const base: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
-        base[index] = cloneTlsBlock(block, block_size);
+        publishTlsSlot(index, block, block_size);
         return index;
     }
-    const index: u16 = @intCast(p.tls_template_len);
-    p.tls_template_len += 1;
-    p.tls_template[index] = block;
-    p.tls_template_sizes[index] = @intCast(block_size);
-    if (currentTeb()) |t| {
-        const base: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
-        base[index] = block;
-    }
+    const raw = tlsAlloc();
+    if (raw >= MAX_TLS_SLOTS) return error.TlsSlotsExhausted;
+    const index: u16 = @intCast(raw);
+    publishTlsSlot(index, block, block_size);
     return index;
 }
 
 pub fn setModuleTlsCurrent(index: u16, block: usize, block_size: usize) void {
-    if (builtin.os.tag == .windows) {
-        if (g_process) |p| {
-            const base: [*]usize = @ptrFromInt(p.teb_ptr.thread_local_storage_pointer);
-            if (index < MAX_TLS_SLOTS) base[index] = cloneTlsBlock(block, block_size);
-            return;
-        }
-    }
-    if (currentTeb()) |t| {
-        const base: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
-        if (index < MAX_TLS_SLOTS) base[index] = cloneTlsBlock(block, block_size);
-    }
+    if (index >= MAX_TLS_SLOTS) return;
+    loader_lock.lock();
+    defer loader_lock.unlock();
+    const t = currentTeb() orelse if (g_process) |p| p.teb_ptr else return;
+    const base: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
+    const cloned = cloneTlsBlock(block, block_size);
+    base[index] = cloned;
+    if (findTebRecord(t)) |rec| rec.owned_tls[index] = if (cloned != block) cloned else 0;
 }
 
 pub fn tlsAlloc() u32 {
@@ -794,16 +886,6 @@ pub fn commandLineA() [:0]const u8 {
 
 pub fn commandLineW() [:0]const u16 {
     if (g_process) |p| return p.cmdline_w;
-    return &[_:0]u16{};
-}
-
-pub fn imagePathA() [:0]const u8 {
-    if (g_process) |p| return p.image_path_a;
-    return "";
-}
-
-pub fn imagePathW() [:0]const u16 {
-    if (g_process) |p| return p.image_path_w;
     return &[_:0]u16{};
 }
 
@@ -906,6 +988,143 @@ pub fn moduleFileNameW(base: usize, out: [*]u16, cap: usize) usize {
     return len;
 }
 
+// ---------------------------------------------------------------------------
+// Per-thread exit state
+// ---------------------------------------------------------------------------
+
+/// FLS destructors registered by `FlsAlloc` (process-wide, like Windows).
+var g_fls_destructors: [MAX_TLS_SLOTS]usize = @splat(0);
+
+/// Registry of every live guest TEB.  Late-loaded modules allocate new TLS
+/// slots that must be published into *all* existing threads, and the exit path
+/// needs to know which TLS blocks a thread owns.  Mutated only under the
+/// recursive loader lock.
+const MAX_TEBS = 128;
+
+const TebRecord = struct {
+    teb: ?*TEB = null,
+    /// True when `initThread` allocated (and therefore owns) the TEB/TLS.
+    owned: bool = false,
+    owned_tls: [MAX_TLS_SLOTS]usize = @splat(0),
+};
+
+var g_tebs: [MAX_TEBS]TebRecord = @splat(.{});
+
+fn findTebRecord(t: *TEB) ?*TebRecord {
+    for (&g_tebs) |*r| {
+        if (r.teb == t) return r;
+    }
+    return null;
+}
+
+fn registerTebRecord(t: *TEB, owned: bool) ?*TebRecord {
+    for (&g_tebs) |*r| {
+        if (r.teb != null) continue;
+        r.* = .{ .teb = t, .owned = owned };
+        return r;
+    }
+    return null;
+}
+
+/// Clone a freshly allocated module TLS slot into every registered thread.
+fn publishTlsSlotToThreads(index: usize, block: usize, block_size: usize) void {
+    for (&g_tebs) |*r| {
+        const t = r.teb orelse continue;
+        const slots: [*]usize = @ptrFromInt(t.thread_local_storage_pointer);
+        const cloned = cloneTlsBlock(block, block_size);
+        slots[index] = cloned;
+        r.owned_tls[index] = if (cloned != block) cloned else 0;
+    }
+}
+
+/// Publish a new module TLS slot: store the template for future threads and
+/// clone the block into every registered thread's own TEB.  The caller holds
+/// the loader lock.
+fn publishTlsSlot(index: usize, block: usize, block_size: usize) void {
+    if (g_process) |p| {
+        p.tls_template[index] = block;
+        p.tls_template_sizes[index] = @intCast(block_size);
+        if (index + 1 > p.tls_template_len) p.tls_template_len = index + 1;
+    }
+    publishTlsSlotToThreads(index, block, block_size);
+}
+
+/// Registry-only TLS publication, used by the unit tests to model a
+/// late-loaded module without booting a full guest process.
+pub fn testPublishTlsSlot(index: usize, block: usize, block_size: usize) void {
+    if (index >= MAX_TLS_SLOTS) return;
+    publishTlsSlotToThreads(index, block, block_size);
+}
+
+/// Register a synthetic TEB for registry unit tests.
+pub fn testRegisterTeb(t: *TEB) void {
+    _ = registerTebRecord(t, false);
+}
+
+pub fn testUnregisterTeb(t: *TEB) void {
+    if (findTebRecord(t)) |r| r.* = .{};
+}
+
+/// `FlsAlloc`: allocate an FLS index and remember its destructor, which the
+/// thread-exit path invokes for every thread that stored a value.
+pub fn flsAlloc(destructor: usize) u32 {
+    const index = tlsAlloc();
+    if (index < MAX_TLS_SLOTS and destructor != 0) g_fls_destructors[index] = destructor;
+    return index;
+}
+
+pub fn flsFree(index: u32) bool {
+    if (index < MAX_TLS_SLOTS) g_fls_destructors[index] = 0;
+    return tlsFree(index);
+}
+
+const FlsDestructor = *const fn (?*anyopaque) callconv(.{ .x86_64_win = .{} }) void;
+
+/// Run FLS destructors for the current thread.  Must be called after
+/// DLL_THREAD_DETACH: the UCRT frees its per-thread data and clears its FLS
+/// slot in its DllMain, so this pass then sees no value.
+pub fn runFlsDestructors() void {
+    for (0..MAX_TLS_SLOTS) |i| {
+        const destructor = g_fls_destructors[i];
+        if (destructor == 0) continue;
+        const value = tlsGet(@intCast(i));
+        if (value == 0) continue;
+        _ = tlsSet(@intCast(i), 0);
+        const f: FlsDestructor = @ptrFromInt(destructor);
+        f(@ptrFromInt(value));
+    }
+}
+
+/// Release the current thread's guest TEB and TLS allocations.  The process's
+/// main TEB belongs to `initProcess` and is never freed here.
+pub fn releaseCurrentThread() void {
+    const t = currentTeb() orelse return;
+    loader_lock.lock();
+    defer loader_lock.unlock();
+    const p = g_process orelse return;
+    const rec = findTebRecord(t) orelse return;
+
+    for (0..MAX_TLS_SLOTS) |i| {
+        const block = rec.owned_tls[i];
+        rec.owned_tls[i] = 0;
+        if (block == 0) continue;
+        const size = p.tls_template_sizes[i];
+        if (size == 0) continue;
+        const mem: [*]align(64) u8 = @ptrFromInt(block);
+        std.heap.page_allocator.free(mem[0..size]);
+    }
+
+    const slots_addr = t.thread_local_storage_pointer;
+    const owned = rec.owned;
+    rec.* = .{};
+    if (!owned) return; // the process's main TEB belongs to initProcess
+
+    if (slots_addr >= 0x10000) {
+        std.heap.page_allocator.free(@as([*]usize, @ptrFromInt(slots_addr))[0..MAX_TLS_SLOTS]);
+    }
+    const teb_mem: [*]align(4096) u8 = @ptrFromInt(@intFromPtr(t));
+    std.heap.page_allocator.free(teb_mem[0 .. TEB_SIZE + 0x2800]);
+}
 
 test "TEB/PEB layout offsets" {
     try std.testing.expectEqual(@as(usize, 0x00), @offsetOf(TEB, "nt_tib"));

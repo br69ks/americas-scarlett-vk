@@ -80,8 +80,6 @@ var g_files: [MAX_FILES]?*FileObj = @splat(null);
 var g_file_lock: SpinLock = .{};
 var g_finds: [MAX_FINDS]?*FindObj = @splat(null);
 var g_find_lock: SpinLock = .{};
-var g_overlapped_logs = std.atomic.Value(u32).init(0);
-var g_io_logs = std.atomic.Value(u32).init(0);
 
 var g_audio_dir: ?[]const u8 = null;
 
@@ -115,6 +113,142 @@ fn ensureDir(path: []const u8) void {
 
 fn setErr(code: u32) void {
     teb.setLastError(code);
+}
+
+fn errnoNow() c_int {
+    return std.c._errno().*;
+}
+
+// Win32 error codes used by the file APIs in this module.
+const ERROR_FILE_NOT_FOUND: u32 = 2;
+const ERROR_ACCESS_DENIED: u32 = 5;
+const ERROR_INVALID_HANDLE: u32 = 6;
+const ERROR_NOT_SAME_DEVICE: u32 = 17;
+const ERROR_WRITE_PROTECT: u32 = 19;
+const ERROR_SHARING_VIOLATION: u32 = 32;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_DISK_FULL: u32 = 112;
+const ERROR_DIR_NOT_EMPTY: u32 = 145;
+const ERROR_ALREADY_EXISTS: u32 = 183;
+const ERROR_DIRECTORY: u32 = 267;
+
+/// Translate the current host errno into the Win32 error the equivalent API
+/// reports.  Callers must read this immediately after the failing libc call.
+fn win32ErrorFromErrno() u32 {
+    if (builtin.os.tag == .windows) return ERROR_ACCESS_DENIED;
+    return switch (errnoNow()) {
+        @backingInt(std.c.E.NOENT) => ERROR_FILE_NOT_FOUND,
+        @backingInt(std.c.E.ACCES), @backingInt(std.c.E.PERM) => ERROR_ACCESS_DENIED,
+        @backingInt(std.c.E.EXIST) => ERROR_ALREADY_EXISTS,
+        @backingInt(std.c.E.NOTEMPTY) => ERROR_DIR_NOT_EMPTY,
+        @backingInt(std.c.E.ISDIR) => ERROR_ACCESS_DENIED,
+        @backingInt(std.c.E.NOTDIR) => ERROR_DIRECTORY,
+        @backingInt(std.c.E.XDEV) => ERROR_NOT_SAME_DEVICE,
+        @backingInt(std.c.E.NOSPC) => ERROR_DISK_FULL,
+        @backingInt(std.c.E.ROFS) => ERROR_WRITE_PROTECT,
+        @backingInt(std.c.E.BUSY) => ERROR_SHARING_VIOLATION,
+        else => ERROR_FILE_NOT_FOUND,
+    };
+}
+
+const FILE_TYPE_UNKNOWN: u32 = 0;
+const FILE_TYPE_DISK: u32 = 1;
+const FILE_TYPE_CHAR: u32 = 2;
+const FILE_TYPE_PIPE: u32 = 3;
+
+const STD_INPUT_HANDLE: u32 = 0xFFFF_FFF6; // (DWORD)-10
+const STD_OUTPUT_HANDLE: u32 = 0xFFFF_FFF5; // (DWORD)-11
+const STD_ERROR_HANDLE: u32 = 0xFFFF_FFF4; // (DWORD)-12
+
+var g_std_handles: [3]usize = .{ 0, 0, 0 }; // 0 = not created, INVALID_HANDLE = cleared
+var g_std_lock: SpinLock = .{};
+
+fn stdSlot(n: u32) ?usize {
+    return switch (n) {
+        STD_INPUT_HANDLE => 0,
+        STD_OUTPUT_HANDLE => 1,
+        STD_ERROR_HANDLE => 2,
+        else => null,
+    };
+}
+
+/// Wrap a host std fd in a FILE* so the regular file handle path serves it.
+fn createStdHandle(slot: usize) usize {
+    if (builtin.os.tag == .windows) {
+        // Windows uses the host's std handles through host_imports.
+        return INVALID_HANDLE;
+    } else {
+        const fd = std.c.dup(@intCast(slot));
+        if (fd < 0) return INVALID_HANDLE;
+        const fp = fdopen(fd, if (slot == 0) "rb" else "wb") orelse {
+            _ = std.c.close(fd);
+            return INVALID_HANDLE;
+        };
+        const handle = allocFile(fp, slot != 0, false);
+        if (handle == 0) {
+            _ = std.c.fclose(fp);
+            return INVALID_HANDLE;
+        }
+        return handle;
+    }
+}
+
+fn shim_GetStdHandle(nStdHandle: u32) callconv(.{ .x86_64_win = .{} }) usize {
+    const slot = stdSlot(nStdHandle) orelse {
+        setErr(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE;
+    };
+    g_std_lock.lock();
+    defer g_std_lock.unlock();
+    if (g_std_handles[slot] == 0) {
+        const handle = createStdHandle(slot);
+        if (handle == INVALID_HANDLE) return INVALID_HANDLE;
+        g_std_handles[slot] = handle;
+    }
+    if (g_std_handles[slot] == INVALID_HANDLE) return 0; // cleared with SetStdHandle
+    return g_std_handles[slot];
+}
+
+fn shim_SetStdHandle(nStdHandle: u32, hHandle: usize) callconv(.{ .x86_64_win = .{} }) i32 {
+    const slot = stdSlot(nStdHandle) orelse {
+        setErr(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    g_std_lock.lock();
+    g_std_handles[slot] = if (hHandle == 0) INVALID_HANDLE else hHandle;
+    g_std_lock.unlock();
+    return 1;
+}
+
+fn shim_GetFileType(hFile: usize) callconv(.{ .x86_64_win = .{} }) u32 {
+    if (hFile == 0 or hFile == INVALID_HANDLE) {
+        setErr(ERROR_INVALID_HANDLE);
+        return FILE_TYPE_UNKNOWN;
+    }
+    const obj = lookupFile(hFile) orelse {
+        setErr(ERROR_INVALID_HANDLE);
+        return FILE_TYPE_UNKNOWN;
+    };
+    if (builtin.os.tag == .windows) return FILE_TYPE_CHAR;
+    const fd = cFileno(obj.fp);
+    if (fd < 0) {
+        setErr(ERROR_INVALID_HANDLE);
+        return FILE_TYPE_UNKNOWN;
+    }
+    if (std.c.isatty(fd) != 0) return FILE_TYPE_CHAR;
+    var sx: std.os.linux.Statx = undefined;
+    @memset(std.mem.asBytes(&sx), 0);
+    const mask: std.os.linux.STATX = .{ .TYPE = true };
+    if (std.c.statx(fd, "", std.os.linux.AT.EMPTY_PATH, mask, &sx) != 0) {
+        setErr(win32ErrorFromErrno());
+        return FILE_TYPE_UNKNOWN;
+    }
+    return switch (sx.mode & 0xF000) {
+        0x8000, 0x6000 => FILE_TYPE_DISK, // regular file / block device
+        0x2000 => FILE_TYPE_CHAR, // character device
+        0x1000, 0xC000 => FILE_TYPE_PIPE, // FIFO / socket
+        else => FILE_TYPE_UNKNOWN,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -287,10 +421,34 @@ fn isDirectory(path_z: [*:0]const u8) bool {
     return false;
 }
 
-fn attributesFor(path_z: [*:0]const u8) u32 {
-    if (isDirectory(path_z)) return FILE_ATTRIBUTE_DIRECTORY;
-    if (probeFileSize(path_z) != null) return FILE_ATTRIBUTE_NORMAL;
-    return INVALID_FILE_ATTRIBUTES;
+/// Query one path with statx so callers can distinguish "missing" from
+/// "denied".  On failure the host errno is left for `win32ErrorFromErrno`.
+fn statxPath(path_z: [*:0]const u8) ?std.os.linux.Statx {
+    if (builtin.os.tag == .windows) {
+        // Non-Linux builds keep the previous libc metadata probe.
+        var sx: std.os.linux.Statx = std.mem.zeroes(std.os.linux.Statx);
+        if (isDirectory(path_z)) {
+            sx.mode = 0x4000;
+            return sx;
+        }
+        const size = probeFileSize(path_z) orelse return null;
+        sx.mode = 0x8000;
+        sx.size = size;
+        return sx;
+    } else {
+        var sx: std.os.linux.Statx = undefined;
+        @memset(std.mem.asBytes(&sx), 0);
+        const mask: std.os.linux.STATX = .{ .TYPE = true, .SIZE = true };
+        if (std.c.statx(std.os.linux.AT.FDCWD, path_z, 0, mask, &sx) != 0) return null;
+        return sx;
+    }
+}
+
+fn attributeFromMode(mode: u16) u32 {
+    return switch (mode & 0xF000) {
+        0x4000 => FILE_ATTRIBUTE_DIRECTORY,
+        else => FILE_ATTRIBUTE_NORMAL,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -385,50 +543,41 @@ fn shim_ReadFile(
         return 0;
     };
     const buf = lpBuffer orelse return 0;
-    var overlapped_offset: ?u64 = null;
-    var overlapped_event: usize = 0;
     if (lpOverlapped) |ov| {
         const lo = std.mem.readInt(u32, ov[16..20], .little);
         const hi = std.mem.readInt(u32, ov[20..24], .little);
-        const raw_offset = (@as(u64, hi) << 32) | lo;
-        overlapped_offset = raw_offset;
-        overlapped_event = std.mem.readInt(usize, ov[24..32], .little);
-        const trace = g_overlapped_logs.fetchAdd(1, .monotonic);
-        if (trace < 32) {
-            std.log.info("[FS] ReadFile(h=0x{x}, len={d}, ov_offset=0x{x}, event=0x{x})", .{
-                hFile, nNumberOfBytesToRead, raw_offset, overlapped_event,
+        const offset: u64 = (@as(u64, hi) << 32) | lo;
+        const event = std.mem.readInt(usize, ov[24..32], .little);
+        if (traceFs()) {
+            std.log.info("[FS] ReadFile(h=0x{x}, len={d}, ov offset=0x{x}, event=0x{x})", .{
+                hFile, nNumberOfBytesToRead, offset, event,
             });
         }
-    }
-    obj.op_lock.lock();
-    defer obj.op_lock.unlock();
-    const before = c_stdio.ftell(obj.fp);
-    const trace_io = hFile >= 0x50048;
-    if (trace_io or g_io_logs.fetchAdd(1, .monotonic) < 64) {
-        if (overlapped_offset) |offset| {
-            std.log.info("[FS] ReadFile(h=0x{x}, len={d}, ov offset=0x{x}, before=0x{x})", .{
-                hFile, nNumberOfBytesToRead, offset, before,
-            });
-        } else {
-            std.log.info("[FS] ReadFile(h=0x{x}, len={d}, sync, before=0x{x})", .{
-                hFile, nNumberOfBytesToRead, before,
-            });
-        }
-    }
-    if (overlapped_offset) |offset| {
-        _ = c_stdio.fseek(obj.fp, @intCast(offset), 0);
-    }
-    const n = std.c.fread(buf, 1, nNumberOfBytesToRead, obj.fp);
-    if (trace_io or g_io_logs.fetchAdd(1, .monotonic) < 64) {
-        std.log.info("[FS] ReadFile(h=0x{x}) -> n={d}, after=0x{x}", .{
-            hFile, n, c_stdio.ftell(obj.fp),
-        });
-    }
-    if (lpNumberOfBytesRead) |out| out.* = @intCast(n);
-    if (lpOverlapped) |ov| {
+        // Overlapped reads are positional: pread must not move the Win32 file
+        // pointer (Windows leaves it untouched for FILE_FLAG_OVERLAPPED I/O).
+        const n = readAt(hFile, offset, buf[0..nNumberOfBytesToRead]) orelse {
+            setErr(ERROR_INVALID_PARAMETER);
+            std.mem.writeInt(u64, ov[0..8], 0xC000_0001, .little); // STATUS_UNSUCCESSFUL
+            std.mem.writeInt(u64, ov[8..16], 0, .little);
+            if (event != 0) _ = sync.setEvent(event);
+            return 0;
+        };
+        if (lpNumberOfBytesRead) |out| out.* = @intCast(n);
         std.mem.writeInt(u64, ov[0..8], 0, .little);
         std.mem.writeInt(u64, ov[8..16], n, .little);
-        if (overlapped_event != 0) _ = sync.setEvent(overlapped_event);
+        if (event != 0) _ = sync.setEvent(event);
+        if (traceFs()) std.log.info("[FS] ReadFile(h=0x{x}) -> n={d}", .{ hFile, n });
+        return 1;
+    }
+
+    obj.op_lock.lock();
+    defer obj.op_lock.unlock();
+    const n = std.c.fread(buf, 1, nNumberOfBytesToRead, obj.fp);
+    if (lpNumberOfBytesRead) |out| out.* = @intCast(n);
+    if (traceFs()) {
+        std.log.info("[FS] ReadFile(h=0x{x}, len={d}, sync) -> n={d}", .{
+            hFile, nNumberOfBytesToRead, n,
+        });
     }
     return 1;
 }
@@ -447,6 +596,12 @@ fn shim_GetOverlappedResult(
     if (status == 0x103 and bWait != 0) {
         const event = std.mem.readInt(usize, ov[24..32], .little);
         if (event != 0) _ = sync.waitForSingleObject(event, 0xFFFF_FFFF);
+    }
+    if (status != 0 and status != 0x103) {
+        // Mirrors a completed overlapped operation that failed.
+        setErr(ERROR_INVALID_PARAMETER);
+        if (lpNumberOfBytesTransferred) |out| out.* = 0;
+        return 0;
     }
     const n = std.mem.readInt(u64, ov[8..16], .little);
     if (lpNumberOfBytesTransferred) |out| out.* = @intCast(n);
@@ -481,16 +636,35 @@ fn shim_WriteFile(
         return 0;
     }
     const buf = lpBuffer orelse return 0;
-    obj.op_lock.lock();
-    defer obj.op_lock.unlock();
     if (lpOverlapped) |ov| {
         const lo = std.mem.readInt(u32, ov[16..20], .little);
         const hi = std.mem.readInt(u32, ov[20..24], .little);
         const offset: u64 = (@as(u64, hi) << 32) | lo;
-        _ = c_stdio.fseek(obj.fp, @intCast(offset), 0);
+        const event = std.mem.readInt(usize, ov[24..32], .little);
+        const n = writeAt(hFile, offset, buf[0..nNumberOfBytesToWrite]) orelse {
+            setErr(ERROR_ACCESS_DENIED);
+            std.mem.writeInt(u64, ov[0..8], 0xC000_0001, .little);
+            std.mem.writeInt(u64, ov[8..16], 0, .little);
+            if (event != 0) _ = sync.setEvent(event);
+            return 0;
+        };
+        if (lpNumberOfBytesWritten) |out| out.* = @intCast(n);
+        std.mem.writeInt(u64, ov[0..8], 0, .little);
+        std.mem.writeInt(u64, ov[8..16], n, .little);
+        if (event != 0) _ = sync.setEvent(event);
+        if (traceFs()) std.log.info("[FS] WriteFile(h=0x{x}, len={d}, ov offset=0x{x}) -> n={d}", .{
+            hFile, nNumberOfBytesToWrite, offset, n,
+        });
+        return 1;
     }
+    obj.op_lock.lock();
+    defer obj.op_lock.unlock();
     const n = std.c.fwrite(buf, 1, nNumberOfBytesToWrite, obj.fp);
+    _ = c_stdio.fflush(obj.fp);
     if (lpNumberOfBytesWritten) |out| out.* = @intCast(n);
+    if (traceFs()) std.log.info("[FS] WriteFile(h=0x{x}, len={d}, sync) -> n={d}", .{
+        hFile, nNumberOfBytesToWrite, n,
+    });
     return 1;
 }
 
@@ -512,7 +686,7 @@ fn shim_SetFilePointerEx(
     defer obj.op_lock.unlock();
     if (c_stdio.fseek(obj.fp, @intCast(liDistanceToMove), whence) != 0) return 0;
     const pos = c_stdio.ftell(obj.fp);
-    if (hFile >= 0x50048 or g_io_logs.fetchAdd(1, .monotonic) < 64) {
+    if (traceFs()) {
         std.log.info("[FS] SetFilePointerEx(h=0x{x}, dist={d}, method={d}) -> 0x{x}", .{
             hFile, liDistanceToMove, dwMoveMethod, pos,
         });
@@ -538,9 +712,7 @@ fn shim_GetFileSizeEx(hFile: usize, lpFileSize: ?*i64) callconv(.{ .x86_64_win =
     const end = c_stdio.ftell(obj.fp);
     _ = c_stdio.fseek(obj.fp, cur, 0);
     if (end < 0) return 0;
-    if (hFile >= 0x50048 or g_io_logs.fetchAdd(1, .monotonic) < 64) {
-        std.log.info("[FS] GetFileSizeEx(h=0x{x}) -> {d}", .{ hFile, end });
-    }
+    if (traceFs()) std.log.info("[FS] GetFileSizeEx(h=0x{x}) -> {d}", .{ hFile, end });
     if (lpFileSize) |out| out.* = @intCast(end);
     return 1;
 }
@@ -573,11 +745,6 @@ fn shim_FlushFileBuffers(hFile: usize) callconv(.{ .x86_64_win = .{} }) i32 {
     return if (c_stdio.fflush(obj.fp) == 0) 1 else 0;
 }
 
-fn shim_CloseHandle(hFile: usize) callconv(.{ .x86_64_win = .{} }) i32 {
-    if (comptime builtin.os.tag == .windows) return if (host.close(hFile)) 1 else 0;
-    return if (freeFile(hFile)) 1 else 0;
-}
-
 pub fn closeHandle(hFile: usize) bool {
     if (comptime builtin.os.tag == .windows) return host.close(hFile);
     return freeFile(hFile);
@@ -588,24 +755,161 @@ fn cFileno(fp: *std.c.FILE) c_int {
     return fileno(fp);
 }
 
+const posix_io = if (builtin.os.tag == .linux) struct {
+    extern "c" fn pread(fd: c_int, buf: ?*anyopaque, count: usize, offset: i64) isize;
+    extern "c" fn pwrite(fd: c_int, buf: ?*const anyopaque, count: usize, offset: i64) isize;
+} else struct {};
+
+var g_host_io_lock: SpinLock = .{};
+
+/// Open a guest path read-only and return a loader file handle.  Used by the
+/// DStorage `IDStorageFileX` objects so `GetHandle` returns a handle that the
+/// normal Win32 ReadFile/GetFileSizeEx shims understand.
+pub fn openReadOnlyWide(path: ?[*:0]const u16) ?usize {
+    var buf: [2048]u8 = undefined;
+    const mapped = mapPath(path, &buf);
+    if (mapped.len == 0) return null;
+    if (comptime builtin.os.tag == .windows) {
+        const h = host.createFileW(mapped, GENERIC_READ, 1, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+        return if (h == INVALID_HANDLE) null else h;
+    }
+    const z = zPath(&buf, mapped);
+    const fp = std.c.fopen(z.ptr, "rb") orelse return null;
+    const handle = allocFile(fp, false, false);
+    if (handle == 0) {
+        _ = std.c.fclose(fp);
+        return null;
+    }
+    return handle;
+}
+
+/// Positional read that does not disturb the Win32 file pointer.  This is the
+/// primitive behind overlapped ReadFile and DStorage file requests.
+pub fn readAt(handle: usize, offset: u64, buf: []u8) ?usize {
+    if (buf.len == 0) return 0;
+    if (offset > @as(u64, std.math.maxInt(i64))) return null;
+    if (comptime builtin.os.tag == .windows) {
+        g_host_io_lock.lock();
+        defer g_host_io_lock.unlock();
+        const saved = host.setFilePointer(handle, 0, 1) orelse return null;
+        defer _ = host.setFilePointer(handle, @intCast(saved), 0);
+        if (host.setFilePointer(handle, @intCast(offset), 0) == null) return null;
+        var got: u32 = 0;
+        const want: u32 = @intCast(@min(buf.len, @as(usize, std.math.maxInt(u32))));
+        if (host.readFile(handle, buf.ptr, want, &got, null) == 0) return null;
+        return got;
+    }
+    const obj = lookupFile(handle) orelse return null;
+    const fd = cFileno(obj.fp);
+    if (fd < 0) return null;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const at = offset + total;
+        if (at > @as(u64, std.math.maxInt(i64))) return null;
+        const rc = posix_io.pread(fd, buf.ptr + total, buf.len - total, @intCast(at));
+        if (rc < 0) {
+            if (errnoNow() == @backingInt(std.c.E.INTR)) continue;
+            return null;
+        }
+        if (rc == 0) break;
+        total += @intCast(rc);
+    }
+    return total;
+}
+
+/// Positional write that does not disturb the Win32 file pointer.
+pub fn writeAt(handle: usize, offset: u64, buf: []const u8) ?usize {
+    if (buf.len == 0) return 0;
+    if (offset > @as(u64, std.math.maxInt(i64))) return null;
+    if (comptime builtin.os.tag == .windows) {
+        g_host_io_lock.lock();
+        defer g_host_io_lock.unlock();
+        const saved = host.setFilePointer(handle, 0, 1) orelse return null;
+        defer _ = host.setFilePointer(handle, @intCast(saved), 0);
+        if (host.setFilePointer(handle, @intCast(offset), 0) == null) return null;
+        var put: u32 = 0;
+        const want: u32 = @intCast(@min(buf.len, @as(usize, std.math.maxInt(u32))));
+        if (host.writeFile(handle, buf.ptr, want, &put, null) == 0) return null;
+        return put;
+    }
+    const obj = lookupFile(handle) orelse return null;
+    if (!obj.writable) return null;
+    const fd = cFileno(obj.fp);
+    if (fd < 0) return null;
+    var total: usize = 0;
+    while (total < buf.len) {
+        const at = offset + total;
+        if (at > @as(u64, std.math.maxInt(i64))) return null;
+        const rc = posix_io.pwrite(fd, buf.ptr + total, buf.len - total, @intCast(at));
+        if (rc < 0) {
+            if (errnoNow() == @backingInt(std.c.E.INTR)) continue;
+            return null;
+        }
+        if (rc == 0) break;
+        total += @intCast(rc);
+    }
+    return total;
+}
+
+/// Current Win32 file pointer (stdio logical position on Linux).
+pub fn currentOffset(handle: usize) ?u64 {
+    if (comptime builtin.os.tag == .windows) {
+        return host.setFilePointer(handle, 0, 1);
+    }
+    const obj = lookupFile(handle) orelse return null;
+    obj.op_lock.lock();
+    defer obj.op_lock.unlock();
+    const pos = c_stdio.ftell(obj.fp);
+    if (pos < 0) return null;
+    return @intCast(pos);
+}
+
+var g_trace_fs: i8 = -1;
+fn traceFs() bool {
+    if (g_trace_fs < 0) g_trace_fs = if (std.c.getenv("SCARLETT_TRACE_FS") != null) 1 else 0;
+    return g_trace_fs == 1;
+}
+
+extern "c" fn fdopen(fd: c_int, mode: [*:0]const u8) ?*std.c.FILE;
+
 // ---------------------------------------------------------------------------
 // Metadata
 // ---------------------------------------------------------------------------
 
 fn shim_GetFileAttributesW(lpFileName: ?[*:0]const u16) callconv(.{ .x86_64_win = .{} }) u32 {
-    const name = lpFileName orelse return INVALID_FILE_ATTRIBUTES;
+    const name = lpFileName orelse {
+        setErr(ERROR_INVALID_PARAMETER);
+        return INVALID_FILE_ATTRIBUTES;
+    };
     var buf: [2048]u8 = undefined;
     const mapped = mapPath(name, &buf);
-    if (mapped.len == 0) return INVALID_FILE_ATTRIBUTES;
-    return attributesFor(zPath(&buf, mapped).ptr);
+    if (mapped.len == 0) {
+        setErr(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    const sx = statxPath(zPath(&buf, mapped).ptr) orelse {
+        setErr(win32ErrorFromErrno());
+        return INVALID_FILE_ATTRIBUTES;
+    };
+    return attributeFromMode(sx.mode);
 }
 
 fn shim_GetFileAttributesA(lpFileName: ?[*:0]const u8) callconv(.{ .x86_64_win = .{} }) u32 {
-    const name = lpFileName orelse return INVALID_FILE_ATTRIBUTES;
+    const name = lpFileName orelse {
+        setErr(ERROR_INVALID_PARAMETER);
+        return INVALID_FILE_ATTRIBUTES;
+    };
     var buf: [2048]u8 = undefined;
     const mapped = mapPathA(name, &buf);
-    if (mapped.len == 0) return INVALID_FILE_ATTRIBUTES;
-    return attributesFor(zPath(&buf, mapped).ptr);
+    if (mapped.len == 0) {
+        setErr(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    const sx = statxPath(zPath(&buf, mapped).ptr) orelse {
+        setErr(win32ErrorFromErrno());
+        return INVALID_FILE_ATTRIBUTES;
+    };
+    return attributeFromMode(sx.mode);
 }
 
 fn shim_GetFileAttributesExW(
@@ -613,32 +917,46 @@ fn shim_GetFileAttributesExW(
     _: u32,
     lpFileInformation: ?[*]u8,
 ) callconv(.{ .x86_64_win = .{} }) i32 {
-    const name = lpFileName orelse return 0;
+    const name = lpFileName orelse {
+        setErr(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
     var buf: [2048]u8 = undefined;
     const mapped = mapPath(name, &buf);
-    if (mapped.len == 0) return 0;
-    const z = zPath(&buf, mapped);
-    const size = probeFileSize(z.ptr) orelse {
-        if (isDirectory(z.ptr)) {
-            if (lpFileInformation) |info| {
-                @memset(info[0..36], 0);
-                std.mem.writeInt(u32, info[0..4], FILE_ATTRIBUTE_DIRECTORY, .little);
-            }
-            return 1;
-        }
-        setErr(2);
+    if (mapped.len == 0) {
+        setErr(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
+    const sx = statxPath(zPath(&buf, mapped).ptr) orelse {
+        setErr(win32ErrorFromErrno());
         return 0;
     };
     if (lpFileInformation) |info| {
         @memset(info[0..36], 0);
-        std.mem.writeInt(u32, info[0..4], FILE_ATTRIBUTE_NORMAL, .little);
-        std.mem.writeInt(u32, info[28..32], @truncate(size >> 32), .little);
-        std.mem.writeInt(u32, info[32..36], @truncate(size & 0xFFFF_FFFF), .little);
+        std.mem.writeInt(u32, info[0..4], attributeFromMode(sx.mode), .little);
+        std.mem.writeInt(u32, info[28..32], @truncate(sx.size >> 32), .little);
+        std.mem.writeInt(u32, info[32..36], @truncate(sx.size & 0xFFFF_FFFF), .little);
     }
     return 1;
 }
 
-fn shim_SetFileAttributesW(_: ?[*:0]const u16, _: u32) callconv(.{ .x86_64_win = .{} }) i32 {
+fn shim_SetFileAttributesW(lpFileName: ?[*:0]const u16, _: u32) callconv(.{ .x86_64_win = .{} }) i32 {
+    const name = lpFileName orelse {
+        setErr(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    var buf: [2048]u8 = undefined;
+    const mapped = mapPath(name, &buf);
+    if (mapped.len == 0) {
+        setErr(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
+    // DOS attribute bits are not modelled; report success once the path exists
+    // and is accessible.
+    _ = statxPath(zPath(&buf, mapped).ptr) orelse {
+        setErr(win32ErrorFromErrno());
+        return 0;
+    };
     return 1;
 }
 
@@ -677,34 +995,59 @@ fn shim_GetDiskFreeSpaceExW(
 // ---------------------------------------------------------------------------
 
 fn shim_CreateDirectoryW(lpPathName: ?[*:0]const u16, _: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
-    const name = lpPathName orelse return 0;
+    const name = lpPathName orelse {
+        setErr(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
     var buf: [2048]u8 = undefined;
     const mapped = mapPath(name, &buf);
-    if (mapped.len == 0) return 0;
+    if (mapped.len == 0) {
+        setErr(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
     if (builtin.os.tag == .linux) {
-        return if (std.c.mkdir(zPath(&buf, mapped).ptr, 0o755) == 0) 1 else 0;
+        if (std.c.mkdir(zPath(&buf, mapped).ptr, 0o755) == 0) return 1;
+        // Win32: an existing directory (or file) is FALSE + ERROR_ALREADY_EXISTS.
+        setErr(win32ErrorFromErrno());
+        return 0;
     }
     return 0;
 }
 
 fn shim_RemoveDirectoryW(lpPathName: ?[*:0]const u16) callconv(.{ .x86_64_win = .{} }) i32 {
-    const name = lpPathName orelse return 0;
+    const name = lpPathName orelse {
+        setErr(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
     var buf: [2048]u8 = undefined;
     const mapped = mapPath(name, &buf);
-    if (mapped.len == 0) return 0;
+    if (mapped.len == 0) {
+        setErr(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
     if (builtin.os.tag == .linux) {
-        return if (std.c.rmdir(zPath(&buf, mapped).ptr) == 0) 1 else 0;
+        if (std.c.rmdir(zPath(&buf, mapped).ptr) == 0) return 1;
+        setErr(win32ErrorFromErrno());
+        return 0;
     }
     return 0;
 }
 
 fn shim_DeleteFileW(lpFileName: ?[*:0]const u16) callconv(.{ .x86_64_win = .{} }) i32 {
-    const name = lpFileName orelse return 0;
+    const name = lpFileName orelse {
+        setErr(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
     var buf: [2048]u8 = undefined;
     const mapped = mapPath(name, &buf);
-    if (mapped.len == 0) return 0;
+    if (mapped.len == 0) {
+        setErr(ERROR_FILE_NOT_FOUND);
+        return 0;
+    }
     if (builtin.os.tag == .linux) {
-        return if (std.c.unlink(zPath(&buf, mapped).ptr) == 0) 1 else 0;
+        if (std.c.unlink(zPath(&buf, mapped).ptr) == 0) return 1;
+        setErr(win32ErrorFromErrno());
+        return 0;
     }
     return 0;
 }
@@ -729,6 +1072,8 @@ fn shim_MoveFileExW(
             _ = std.c.unlink(new_z.ptr);
             if (std.c.rename(old_z.ptr, new_z.ptr) == 0) return 1;
         }
+        setErr(win32ErrorFromErrno());
+        return 0;
     }
     return 0;
 }
@@ -1180,6 +1525,7 @@ pub fn mapAnsiPath(a: ?[*:0]const u8, out: *[2048]u8) []const u8 {
 
 /// File size for a handle, preserving the current file position.
 pub fn fileSize(handle: usize) ?u64 {
+    if (comptime builtin.os.tag == .windows) return host.getFileSize(handle);
     const obj = lookupFile(handle) orelse return null;
     const cur = c_stdio.ftell(obj.fp);
     if (c_stdio.fseek(obj.fp, 0, 2) != 0) return null;
@@ -1342,7 +1688,9 @@ pub fn resolve(sym_name: []const u8) ?usize {
         .{ "GetFileSizeEx", @intFromPtr(&shim_GetFileSizeEx) },
         .{ "SetEndOfFile", @intFromPtr(&shim_SetEndOfFile) },
         .{ "FlushFileBuffers", @intFromPtr(&shim_FlushFileBuffers) },
-        .{ "CloseHandle", @intFromPtr(&shim_CloseHandle) },
+        .{ "GetStdHandle", @intFromPtr(&shim_GetStdHandle) },
+        .{ "SetStdHandle", @intFromPtr(&shim_SetStdHandle) },
+        .{ "GetFileType", @intFromPtr(&shim_GetFileType) },
         .{ "GetFileTime", @intFromPtr(&shim_GetFileTime) },
         .{ "SetFileTime", @intFromPtr(&shim_SetFileTime) },
         .{ "GetDiskFreeSpaceExW", @intFromPtr(&shim_GetDiskFreeSpaceExW) },

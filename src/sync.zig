@@ -13,8 +13,8 @@ pub const INFINITE: u32 = 0xFFFF_FFFF;
 pub const WAIT_OBJECT_0: u32 = 0;
 pub const WAIT_TIMEOUT: u32 = 0x102;
 pub const WAIT_FAILED: u32 = 0xFFFF_FFFF;
-pub const WAIT_ABANDONED: u32 = 0x80;
 pub const ERROR_INVALID_HANDLE: u32 = 6;
+pub const ERROR_INVALID_PARAMETER: u32 = 87;
 pub const ERROR_NOT_OWNER: u32 = 288;
 pub const ERROR_TOO_MANY_POSTS: u32 = 298;
 pub const STILL_ACTIVE: u32 = 259;
@@ -22,7 +22,6 @@ pub const STILL_ACTIVE: u32 = 259;
 const HANDLE_BASE: usize = 0x100;
 const HANDLE_STRIDE: usize = 8;
 const MAX_HANDLES: usize = 4096;
-
 
 const SpinLock = struct {
     v: AtomicU32 = .init(0),
@@ -39,12 +38,17 @@ const SpinLock = struct {
 
 const Kind = enum { event, mutex, semaphore, thread };
 
+/// A handle-table entry.  It is reference counted so that a thread which is
+/// waiting on (or otherwise using) an object keeps it alive even if another
+/// thread closes the handle concurrently.  The table owns one reference; every
+/// `acquireRef` takes another.
 const Entry = struct {
     kind: Kind,
     ptr: *anyopaque,
+    refs: AtomicU32 = .init(1),
 };
 
-var g_handles: [MAX_HANDLES]?Entry = @splat(null);
+var g_handles: [MAX_HANDLES]?*Entry = @splat(null);
 var g_handle_lock: SpinLock = .{};
 var g_cs_lock: SpinLock = .{};
 
@@ -188,6 +192,8 @@ const Semaphore = struct {
 const ThreadObj = struct {
     tid: u32,
     exited: AtomicU32 = .init(0),
+    /// Thread exit code; STILL_ACTIVE while the thread is running.
+    code: AtomicU32 = .init(STILL_ACTIVE),
 };
 
 fn createEvent(manual: bool, initial: bool) usize {
@@ -225,58 +231,103 @@ pub fn createThreadHandle(tid: u32) usize {
     return h;
 }
 
-pub fn markThreadExited(handle: usize) void {
+pub fn markThreadExitedWithCode(handle: usize, code: u32) void {
     const e = lookup(handle) orelse return;
+    defer releaseRef(e);
+    markThreadExitedEntry(e, code);
+}
+
+/// Acquire the thread object reference used by that thread's own exit path.
+/// Publishing the exit code through this reference (instead of the handle)
+/// cannot hit a recycled handle slot.
+pub fn acquireThreadRef(handle: usize) ?*anyopaque {
+    const e = lookup(handle) orelse return null;
+    if (e.kind != .thread) {
+        releaseRef(e);
+        return null;
+    }
+    return @ptrCast(e);
+}
+
+pub fn releaseThreadRef(entry_ref: *anyopaque) void {
+    const e: *Entry = @ptrCast(@alignCast(entry_ref));
+    releaseRef(e);
+}
+
+/// Publish an exit code through an acquired thread reference.
+pub fn markThreadExitedRef(entry_ref: *anyopaque, code: u32) void {
+    const e: *Entry = @ptrCast(@alignCast(entry_ref));
+    markThreadExitedEntry(e, code);
+}
+
+fn markThreadExitedEntry(e: *Entry, code: u32) void {
     if (e.kind != .thread) return;
     const t: *ThreadObj = @ptrCast(@alignCast(e.ptr));
+    t.code.store(code, .release);
     t.exited.store(1, .release);
     futexWake(&t.exited, std.math.maxInt(u32));
 }
 
+/// `GetCurrentThread` pseudo handle: (HANDLE)-2.
+pub const CURRENT_THREAD_HANDLE: usize = @bitCast(@as(isize, -2));
+
 fn allocHandle(kind: Kind, ptr: *anyopaque) usize {
+    const entry = std.heap.page_allocator.create(Entry) catch return 0;
+    entry.* = .{ .kind = kind, .ptr = ptr };
     g_handle_lock.lock();
     defer g_handle_lock.unlock();
     for (&g_handles, 0..) |*slot, i| {
-        if (slot.* == null) {
-            slot.* = .{ .kind = kind, .ptr = ptr };
-            return HANDLE_BASE + i * HANDLE_STRIDE;
-        }
+        if (slot.* != null) continue;
+        slot.* = entry;
+        return HANDLE_BASE + i * HANDLE_STRIDE;
     }
+    std.heap.page_allocator.destroy(entry);
     return 0;
 }
 
-fn lookup(handle: usize) ?Entry {
+fn handleIndex(handle: usize) ?usize {
     if (handle < HANDLE_BASE) return null;
     const off = handle - HANDLE_BASE;
     if (off % HANDLE_STRIDE != 0) return null;
     const idx = off / HANDLE_STRIDE;
     if (idx >= MAX_HANDLES) return null;
+    return idx;
+}
+
+/// Acquire a reference to the object behind `handle`.  Callers must release it.
+fn lookup(handle: usize) ?*Entry {
+    const idx = handleIndex(handle) orelse return null;
     g_handle_lock.lock();
-    defer g_handle_lock.unlock();
-    return g_handles[idx];
+    const entry = g_handles[idx];
+    if (entry) |e| _ = e.refs.fetchAdd(1, .monotonic);
+    g_handle_lock.unlock();
+    return entry;
+}
+
+fn releaseRef(e: *Entry) void {
+    if (e.refs.fetchSub(1, .acq_rel) != 1) return;
+    destroy(e);
 }
 
 fn releaseHandle(handle: usize) bool {
-    if (handle < HANDLE_BASE) return false;
-    const off = handle - HANDLE_BASE;
-    if (off % HANDLE_STRIDE != 0) return false;
-    const idx = off / HANDLE_STRIDE;
-    if (idx >= MAX_HANDLES) return false;
+    const idx = handleIndex(handle) orelse return false;
     g_handle_lock.lock();
     const entry = g_handles[idx];
     g_handles[idx] = null;
     g_handle_lock.unlock();
-    if (entry) |e| destroy(e);
-    return entry != null;
+    const e = entry orelse return false;
+    releaseRef(e); // drop the table's reference
+    return true;
 }
 
-fn destroy(e: Entry) void {
+fn destroy(e: *Entry) void {
     switch (e.kind) {
         .event => std.heap.page_allocator.destroy(@as(*Event, @ptrCast(@alignCast(e.ptr)))),
         .mutex => std.heap.page_allocator.destroy(@as(*Mutex, @ptrCast(@alignCast(e.ptr)))),
         .semaphore => std.heap.page_allocator.destroy(@as(*Semaphore, @ptrCast(@alignCast(e.ptr)))),
         .thread => std.heap.page_allocator.destroy(@as(*ThreadObj, @ptrCast(@alignCast(e.ptr)))),
     }
+    std.heap.page_allocator.destroy(e);
 }
 
 // ---------------------------------------------------------------------------
@@ -349,7 +400,7 @@ fn waitThread(t: *ThreadObj, ms: u32) u32 {
     }
 }
 
-fn isSignaled(e: Entry) bool {
+fn isSignaled(e: *Entry) bool {
     switch (e.kind) {
         .event => {
             const ev: *Event = @ptrCast(@alignCast(e.ptr));
@@ -371,7 +422,7 @@ fn isSignaled(e: Entry) bool {
     }
 }
 
-fn tryAcquire(e: Entry) bool {
+fn tryAcquire(e: *Entry) bool {
     switch (e.kind) {
         .event => {
             const ev: *Event = @ptrCast(@alignCast(e.ptr));
@@ -411,6 +462,7 @@ pub fn createEventW(manual: bool, initial: bool) usize {
 
 pub fn setEvent(handle: usize) bool {
     const e = lookup(handle) orelse return false;
+    defer releaseRef(e);
     if (e.kind != .event) return false;
     const ev: *Event = @ptrCast(@alignCast(e.ptr));
     ev.state.store(1, .release);
@@ -420,6 +472,7 @@ pub fn setEvent(handle: usize) bool {
 
 pub fn resetEvent(handle: usize) bool {
     const e = lookup(handle) orelse return false;
+    defer releaseRef(e);
     if (e.kind != .event) return false;
     const ev: *Event = @ptrCast(@alignCast(e.ptr));
     ev.state.store(0, .release);
@@ -428,6 +481,7 @@ pub fn resetEvent(handle: usize) bool {
 
 pub fn pulseEvent(handle: usize) bool {
     const e = lookup(handle) orelse return false;
+    defer releaseRef(e);
     if (e.kind != .event) return false;
     const ev: *Event = @ptrCast(@alignCast(e.ptr));
     ev.state.store(1, .release);
@@ -442,6 +496,7 @@ pub fn createMutexW(initial_owner: bool) usize {
 
 pub fn releaseMutex(handle: usize) bool {
     const e = lookup(handle) orelse return false;
+    defer releaseRef(e);
     if (e.kind != .mutex) return false;
     const m: *Mutex = @ptrCast(@alignCast(e.ptr));
     return unlockMutex(m);
@@ -453,6 +508,7 @@ pub fn createSemaphoreW(initial: u32, max: u32) usize {
 
 pub fn releaseSemaphore(handle: usize, count: u32, previous: ?*u32) bool {
     const e = lookup(handle) orelse return false;
+    defer releaseRef(e);
     if (e.kind != .semaphore) return false;
     const s: *Semaphore = @ptrCast(@alignCast(e.ptr));
     while (true) {
@@ -478,6 +534,7 @@ pub fn waitForSingleObject(handle: usize, ms: u32) u32 {
         teb.setLastError(ERROR_INVALID_HANDLE);
         return WAIT_FAILED;
     };
+    defer releaseRef(e);
     return switch (e.kind) {
         .event => waitEvent(@ptrCast(@alignCast(e.ptr)), ms),
         .mutex => if (lockMutex(@ptrCast(@alignCast(e.ptr)), ms)) WAIT_OBJECT_0 else WAIT_TIMEOUT,
@@ -487,15 +544,31 @@ pub fn waitForSingleObject(handle: usize, ms: u32) u32 {
 }
 
 pub fn waitForMultipleObjects(handles: []const usize, wait_all: bool, ms: u32) u32 {
+    // Acquire every object before waiting: a concurrent CloseHandle must not
+    // free an object this waiter is using.
+    var refs: [64]*Entry = undefined;
+    if (handles.len > refs.len) {
+        teb.setLastError(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
+    var acquired: usize = 0;
+    defer {
+        for (refs[0..acquired]) |e| releaseRef(e);
+    }
+    for (handles, 0..) |h, i| {
+        const e = lookup(h) orelse {
+            teb.setLastError(ERROR_INVALID_HANDLE);
+            return WAIT_FAILED;
+        };
+        refs[i] = e;
+        acquired += 1;
+    }
+
     const deadline = deadlineFrom(ms);
     while (true) {
         if (wait_all) {
             var all = true;
-            for (handles) |h| {
-                const e = lookup(h) orelse {
-                    teb.setLastError(ERROR_INVALID_HANDLE);
-                    return WAIT_FAILED;
-                };
+            for (refs[0..acquired]) |e| {
                 if (!isSignaled(e)) {
                     all = false;
                     break;
@@ -503,18 +576,11 @@ pub fn waitForMultipleObjects(handles: []const usize, wait_all: bool, ms: u32) u
             }
             if (all) {
                 // Consume auto-reset objects only once all were signaled.
-                for (handles) |h| {
-                    const e = lookup(h) orelse continue;
-                    _ = tryAcquire(e);
-                }
+                for (refs[0..acquired]) |e| _ = tryAcquire(e);
                 return WAIT_OBJECT_0;
             }
         } else {
-            for (handles, 0..) |h, i| {
-                const e = lookup(h) orelse {
-                    teb.setLastError(ERROR_INVALID_HANDLE);
-                    return WAIT_FAILED;
-                };
+            for (refs[0..acquired], 0..) |e, i| {
                 if (isSignaled(e) and tryAcquire(e)) return WAIT_OBJECT_0 + @as(u32, @intCast(i));
             }
         }
@@ -530,10 +596,15 @@ pub fn closeHandle(handle: usize) bool {
 }
 
 pub fn getExitCodeThread(handle: usize, out: *u32) bool {
+    if (handle == CURRENT_THREAD_HANDLE) {
+        out.* = STILL_ACTIVE;
+        return true;
+    }
     const e = lookup(handle) orelse return false;
+    defer releaseRef(e);
     if (e.kind != .thread) return false;
     const t: *ThreadObj = @ptrCast(@alignCast(e.ptr));
-    out.* = if (t.exited.load(.acquire) != 0) 0 else STILL_ACTIVE;
+    out.* = t.code.load(.acquire);
     return true;
 }
 

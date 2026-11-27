@@ -7,370 +7,152 @@ const std = @import("std");
 const builtin = @import("builtin");
 const teb = @import("../teb.zig");
 const module = @import("../module.zig");
+const seh = @import("../seh.zig");
 const sync = @import("../sync.zig");
+const thread_exit = @import("../thread_exit.zig");
 const win32_fs = @import("win32_fs.zig");
 
 const win: std.builtin.CallingConvention = .{ .x86_64_win = .{} };
-
-var g_unhandled_filter: usize = 0;
 
 // ---------------------------------------------------------------------------
 // CONTEXT / SEH
 // ---------------------------------------------------------------------------
 
-/// x64 CONTEXT prefix up to Rip.  Offsets match winnt.h.
-const Context = extern struct {
-    p1: u64 = 0,
-    p2: u64 = 0,
-    p3: u64 = 0,
-    p4: u64 = 0,
-    p5: u64 = 0,
-    p6: u64 = 0,
-    context_flags: u32 = 0,
-    mx_csr: u32 = 0,
-    seg_cs: u16 = 0,
-    seg_ds: u16 = 0,
-    seg_es: u16 = 0,
-    seg_fs: u16 = 0,
-    seg_gs: u16 = 0,
-    seg_ss: u16 = 0,
-    eflags: u32 = 0,
-    dr0: u64 = 0,
-    dr1: u64 = 0,
-    dr2: u64 = 0,
-    dr3: u64 = 0,
-    dr6: u64 = 0,
-    dr7: u64 = 0,
-    rax: u64 = 0,
-    rcx: u64 = 0,
-    rdx: u64 = 0,
-    rbx: u64 = 0,
-    rsp: u64 = 0,
-    rbp: u64 = 0,
-    rsi: u64 = 0,
-    rdi: u64 = 0,
-    r8: u64 = 0,
-    r9: u64 = 0,
-    r10: u64 = 0,
-    r11: u64 = 0,
-    r12: u64 = 0,
-    r13: u64 = 0,
-    r14: u64 = 0,
-    r15: u64 = 0,
-    rip: u64 = 0,
-    _pad_xmm: [0x300 - 0x100]u8 = @splat(0),
-    xmm: [16][16]u8 = @splat(@splat(0)),
-};
-
-comptime {
-    std.debug.assert(@offsetOf(Context, "context_flags") == 0x30);
-    std.debug.assert(@offsetOf(Context, "rax") == 0x78);
-    std.debug.assert(@offsetOf(Context, "rip") == 0xF8);
-    std.debug.assert(@offsetOf(Context, "xmm") == 0x300);
-}
-
-/// Naked on purpose: the guest calls this with RCX = CONTEXT*.  It must not
-/// have a prologue, or the captured RSP/RIP belong to the shim.
-fn rtlCaptureContext() callconv(.naked) void {
-    asm volatile (
-        \\ movq %%rax, 0x78(%%rcx)
-        \\ movq %%rcx, 0x80(%%rcx)
-        \\ movq %%rdx, 0x88(%%rcx)
-        \\ movq %%rbx, 0x90(%%rcx)
-        \\ movq %%rsp, 0x98(%%rcx)
-        \\ movq %%rbp, 0xA0(%%rcx)
-        \\ movq %%rsi, 0xA8(%%rcx)
-        \\ movq %%rdi, 0xB0(%%rcx)
-        \\ movq %%r8,  0xB8(%%rcx)
-        \\ movq %%r9,  0xC0(%%rcx)
-        \\ movq %%r10, 0xC8(%%rcx)
-        \\ movq %%r11, 0xD0(%%rcx)
-        \\ movq %%r12, 0xD8(%%rcx)
-        \\ movq %%r13, 0xE0(%%rcx)
-        \\ movq %%r14, 0xE8(%%rcx)
-        \\ movq %%r15, 0xF0(%%rcx)
-        \\ movq (%%rsp), %%rax
-        \\ movq %%rax, 0xF8(%%rcx)
-        \\ leaq 8(%%rsp), %%rax
-        \\ movq %%rax, 0x98(%%rcx)
-        \\ movl $0x0010000F, 0x30(%%rcx)
-        \\ stmxcsr 0x34(%%rcx)
-        \\ movw %%cs, 0x38(%%rcx)
-        \\ movw %%ss, 0x42(%%rcx)
-        \\ pushfq
-        \\ popq %%rax
-        \\ movl %%eax, 0x44(%%rcx)
-        \\ ret
-    );
-}
-
-fn shim_RtlLookupFunctionEntry(
-    control_pc: u64,
-    image_base_out: ?*u64,
-    _: ?*anyopaque,
-) callconv(win) ?*const module.RuntimeFunction {
-    const m = module.findByAddress(@intCast(control_pc)) orelse return null;
-    if (image_base_out) |out| out.* = m.base;
-    return module.lookupFunctionEntry(@intCast(control_pc));
-}
-
-fn shim_RtlPcToFileHeader(pc: u64, image_base_out: ?*u64) callconv(win) u64 {
-    const m = module.findByAddress(@intCast(pc)) orelse return 0;
-    if (image_base_out) |out| out.* = m.base;
-    return m.base;
-}
-
-const UnwindOp = struct {
-    kind: u8,
-    info: u8,
-    operand: u64,
-};
-
-fn readU16(p: [*]const u8, off: usize) u16 {
-    return std.mem.readInt(u16, p[off..][0..2], .little);
-}
-
-fn readU32(p: [*]const u8, off: usize) u32 {
-    return std.mem.readInt(u32, p[off..][0..4], .little);
-}
-
-fn readU64(p: [*]const u8, off: usize) u64 {
-    return std.mem.readInt(u64, p[off..][0..8], .little);
-}
-
-fn regField(ctx: *Context, reg: u8) *u64 {
-    return switch (reg) {
-        0 => &ctx.rax,
-        1 => &ctx.rcx,
-        2 => &ctx.rdx,
-        3 => &ctx.rbx,
-        4 => &ctx.rsp,
-        5 => &ctx.rbp,
-        6 => &ctx.rsi,
-        7 => &ctx.rdi,
-        8 => &ctx.r8,
-        9 => &ctx.r9,
-        10 => &ctx.r10,
-        11 => &ctx.r11,
-        12 => &ctx.r12,
-        13 => &ctx.r13,
-        14 => &ctx.r14,
-        15 => &ctx.r15,
-        else => &ctx.rsp,
-    };
-}
-
-fn applyUnwindOp(ctx: *Context, op: UnwindOp) void {
-    const stack: [*]const u8 = @ptrFromInt(@as(usize, @intCast(ctx.rsp)));
-    switch (op.kind) {
-        0 => { // PUSH_NONVOL
-            regField(ctx, op.info).* = readU64(stack, 0);
-            ctx.rsp += 8;
-        },
-        1 => { // ALLOC_LARGE
-            ctx.rsp += op.operand;
-        },
-        2 => { // ALLOC_SMALL
-            ctx.rsp += @as(u64, op.info) * 8 + 8;
-        },
-        3 => {}, // SET_FPREG, handled by the caller
-        4 => { // SAVE_NONVOL
-            regField(ctx, op.info).* = readU64(stack, @intCast(op.operand));
-        },
-        5 => { // SAVE_NONVOL_FAR
-            regField(ctx, op.info).* = readU64(stack, @intCast(op.operand));
-        },
-        8 => { // SAVE_XMM128
-            const off: usize = @intCast(op.operand);
-            @memcpy(ctx.xmm[op.info][0..16], stack[off..][0..16]);
-        },
-        9 => { // SAVE_XMM128_FAR
-            const off: usize = @intCast(op.operand);
-            @memcpy(ctx.xmm[op.info][0..16], stack[off..][0..16]);
-        },
-        10 => { // PUSH_MACHFRAME
-            if (op.info != 0) ctx.rsp += 8; // error code
-            ctx.rip = readU64(stack, 8);
-            ctx.rsp += 8 + 32; // RIP, CS, EFLAGS, RSP, SS
-        },
-        else => {},
-    }
-}
-
-fn shim_RtlVirtualUnwind(
-    _: u32,
-    image_base: u64,
-    control_pc: u64,
-    function_entry: ?*const module.RuntimeFunction,
-    context_record: ?*anyopaque,
-    handler_data: ?*?*anyopaque,
-    establisher: ?*u64,
-    _: ?*anyopaque,
-) callconv(win) ?*anyopaque {
-    const fe = function_entry orelse return null;
-    const ctx: *Context = @ptrCast(@alignCast(context_record orelse return null));
-    const info: [*]const u8 = @ptrFromInt(@as(usize, @intCast(image_base + fe.unwind)));
-
-    const version_flags = info[0];
-    if (builtin.os.tag == .linux) {
-        std.log.err("[UNW] img=0x{x} pc=0x{x} rva=0x{x} fe=0x{x} begin=0x{x} end=0x{x} unwind=0x{x} info={x:0>2}{x:0>2}{x:0>2}{x:0>2} rsp=0x{x}", .{
-            image_base, control_pc, control_pc - image_base, @intFromPtr(fe), fe.begin, fe.end, fe.unwind, info[0], info[1], info[2], info[3], ctx.rsp,
-        });
-    }
-    if (version_flags & 0x7 != 1) return null;
-    const flags = version_flags >> 3;
-    const count: usize = info[2];
-    const frame_reg: u8 = info[3] & 0xF;
-    const frame_offset: u8 = info[3] >> 4;
-
-    const alloc = std.heap.c_allocator;
-    const ops = alloc.alloc(UnwindOp, 256) catch return null;
-    defer alloc.free(ops);
-    var op_count: usize = 0;
-    var idx: usize = 0;
-    while (idx < count and idx < 255) {
-        const code_off = idx * 2;
-        const b0 = info[4 + code_off];
-        const b1 = info[4 + code_off + 1];
-        const kind = b1 & 0xF;
-        const op_info = b1 >> 4;
-        var operand: u64 = 0;
-        var slots: usize = 1;
-
-        switch (kind) {
-            1 => { // ALLOC_LARGE
-                if (op_info == 0) {
-                    operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) * 8;
-                    slots = 2;
-                } else {
-                    operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) |
-                        (@as(u64, readU16(info, 4 + (idx + 2) * 2)) << 16);
-                    slots = 3;
-                }
-            },
-            2 => operand = @as(u64, op_info) * 8 + 8,
-            4 => {
-                operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) * 8;
-                slots = 2;
-            },
-            5 => {
-                operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) |
-                    (@as(u64, readU16(info, 4 + (idx + 2) * 2)) << 16);
-                slots = 3;
-            },
-            8 => { // SAVE_XMM128
-                operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) * 16;
-                slots = 2;
-            },
-            9 => { // SAVE_XMM128_FAR
-                operand = @as(u64, readU16(info, 4 + (idx + 1) * 2)) |
-                    (@as(u64, readU16(info, 4 + (idx + 2) * 2)) << 16);
-                slots = 3;
-            },
-            else => {},
-        }
-
-        if (builtin.os.tag == .linux and op_count < 12) {
-            std.log.err("[UNWOP] {d}: kind={d} info={d} operand=0x{x}", .{ op_count, kind, op_info, operand });
-        }
-        ops[op_count] = .{ .kind = kind, .info = op_info, .operand = operand };
-        op_count += 1;
-        idx += slots;
-        _ = b0;
-    }
-
-    // Unwind codes are stored in descending prolog-offset order; applying them
-    // in that order undoes the prolog.
-    var i: usize = 0;
-    while (i < op_count) : (i += 1) {
-        if (ops[i].kind == 3) {
-            if (frame_reg != 0) {
-                ctx.rsp = regField(ctx, frame_reg).* - @as(u64, frame_offset) * 16;
-            }
-            continue;
-        }
-        applyUnwindOp(ctx, ops[i]);
-    }
-
-    if (establisher) |out| out.* = ctx.rsp;
-
-    // Pop the return address.
-    const stack: [*]const u8 = @ptrFromInt(@as(usize, @intCast(ctx.rsp)));
-    ctx.rip = readU64(stack, 0);
-    ctx.rsp += 8;
-
-    if (flags & 0x3 != 0) {
-        const handler_off = std.mem.alignForward(usize, 4 + count * 2, 4);
-        const handler_rva = readU32(info, handler_off);
-        if (handler_data) |out| out.* = @ptrFromInt(@as(usize, @intCast(image_base + handler_off + 4)));
-        return @ptrFromInt(@as(usize, @intCast(image_base + handler_rva)));
-    }
-    return null;
-}
-
-fn shim_RtlUnwind(_: ?*anyopaque, _: ?*anyopaque, _: ?*anyopaque, _: ?*anyopaque) callconv(win) void {
-    std.log.warn("[SEH] RtlUnwind called (no-op)", .{});
-}
-
-fn shim_RtlUnwindEx(
-    target_frame: ?*anyopaque,
-    target_ip: ?*anyopaque,
-    exception_record: ?*anyopaque,
-    return_value: ?*anyopaque,
-    context_record: ?*anyopaque,
-    history_table: ?*anyopaque,
-) callconv(win) void {
-    _ = target_frame;
-    _ = target_ip;
-    _ = exception_record;
-    _ = return_value;
-    _ = context_record;
-    _ = history_table;
-    std.log.warn("[SEH] RtlUnwindEx called (no-op)", .{});
-}
-
-fn shim_RaiseException(
-    code: u32,
-    flags: u32,
-    nargs: u32,
-    args: ?[*]const u64,
-) callconv(win) noreturn {
-    std.log.err("[SEH] RaiseException(code=0x{x}, flags=0x{x}, nargs={d})", .{ code, flags, nargs });
-    if (args) |a| {
-        var i: usize = 0;
-        while (i < nargs and i < 8) : (i += 1) {
-            std.log.err("  arg[{d}] = 0x{x}", .{ i, a[i] });
-        }
-    }
-    std.process.exit(@as(u8, 0xE0) | @as(u8, @truncate(code)));
-}
-
-fn shim_SetUnhandledExceptionFilter(filter: ?*anyopaque) callconv(win) ?*anyopaque {
-    const previous = g_unhandled_filter;
-    g_unhandled_filter = if (filter) |f| @intFromPtr(f) else 0;
-    return if (previous == 0) null else @ptrFromInt(previous);
-}
-
-const UnhandledFilterFn = *const fn (?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32;
-
-fn shim_UnhandledExceptionFilter(info: ?*anyopaque) callconv(win) i32 {
-    if (g_unhandled_filter != 0) {
-        const f: UnhandledFilterFn = @ptrFromInt(g_unhandled_filter);
-        return f(info);
-    }
-    return 1; // EXCEPTION_EXECUTE_HANDLER
-}
-
-fn shim_AddVectoredExceptionHandler(_: u32, _: ?*anyopaque) callconv(win) ?*anyopaque {
-    return @ptrFromInt(@as(usize, 1));
-}
-
-fn shim_RemoveVectoredExceptionHandler(_: ?*anyopaque) callconv(win) u32 {
-    return 1;
-}
+// CONTEXT capture/restore, virtual unwind, dispatch and RtlUnwind live in
+// ../seh.zig; crt_extra only re-exports them through `resolve`.
 
 fn shim_IsDebuggerPresent() callconv(win) i32 {
     return 0;
+}
+
+/// The loader never converts guest threads to fibers, so every thread is a
+/// plain thread.  The UCRT checks this before using the TEB global-state slot.
+fn shim_IsThreadAFiber() callconv(win) i32 {
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// OS version
+// ---------------------------------------------------------------------------
+
+/// The guest is a Windows 10 GDK title; report the version it was built for.
+/// The UCRT selects the TEB `ReservedForCrt` global-state slot over an FLS
+/// slot when `VerifyVersionInfoW` says the OS is Windows 10 or newer.
+const os_major: u32 = 10;
+const os_minor: u32 = 0;
+const os_build: u32 = 19041;
+const os_platform_id: u32 = 2; // VER_PLATFORM_WIN32_NT
+const os_product_type: u8 = 1; // VER_NT_WORKSTATION
+
+const VER_MINORVERSION: u32 = 0x01;
+const VER_MAJORVERSION: u32 = 0x02;
+const VER_BUILDNUMBER: u32 = 0x04;
+const VER_PLATFORMID: u32 = 0x08;
+const VER_SERVICEPACKMINOR: u32 = 0x10;
+const VER_SERVICEPACKMAJOR: u32 = 0x20;
+const VER_SUITENAME: u32 = 0x40;
+const VER_PRODUCT_TYPE: u32 = 0x80;
+
+const VER_EQUAL: u8 = 1;
+const VER_GREATER: u8 = 2;
+const VER_GREATER_EQUAL: u8 = 3;
+const VER_LESS: u8 = 4;
+const VER_LESS_EQUAL: u8 = 5;
+const VER_AND: u8 = 6;
+const VER_OR: u8 = 7;
+
+const ERROR_OLD_WIN_VERSION: u32 = 1150;
+
+const OsVersionInfoW = extern struct {
+    dwOSVersionInfoSize: u32,
+    dwMajorVersion: u32,
+    dwMinorVersion: u32,
+    dwBuildNumber: u32,
+    dwPlatformId: u32,
+    szCSDVersion: [128]u16,
+};
+
+const OsVersionInfoExW = extern struct {
+    base: OsVersionInfoW,
+    wServicePackMajor: u16,
+    wServicePackMinor: u16,
+    wSuiteMask: u16,
+    wProductType: u8,
+    wReserved: u8,
+};
+
+/// Three condition bits per `VER_*` field, in field order.
+fn conditionAt(condition_mask: u64, comptime field: u6) u8 {
+    return @truncate((condition_mask >> (field * 3)) & 0x7);
+}
+
+fn testCondition(condition: u8, actual: u64, requested: u64) bool {
+    return switch (condition) {
+        VER_EQUAL => actual == requested,
+        VER_GREATER => actual > requested,
+        VER_GREATER_EQUAL => actual >= requested,
+        VER_LESS => actual < requested,
+        VER_LESS_EQUAL => actual <= requested,
+        // Suite mask conditions are set tests, not ordering comparisons.
+        VER_AND => (actual & requested) == requested,
+        VER_OR => (actual & requested) != 0,
+        else => false,
+    };
+}
+
+fn shim_VerSetConditionMask(condition_mask: u64, type_mask: u32, condition: u8) callconv(win) u64 {
+    var mask = condition_mask;
+    for (0..8) |i| {
+        const type_bit: u32 = @as(u32, 1) << @intCast(i);
+        if (type_mask & type_bit == 0) continue;
+        const shift: u6 = @intCast(i * 3);
+        const clear = ~(@as(u64, 0x7) << shift);
+        mask = (mask & clear) | (@as(u64, condition & 0x7) << shift);
+    }
+    return mask;
+}
+
+fn shim_VerifyVersionInfoW(
+    info: ?*anyopaque,
+    type_mask: u32,
+    condition_mask: u64,
+) callconv(win) i32 {
+    const raw = info orelse return 0;
+    const version: *const OsVersionInfoW = @ptrCast(@alignCast(raw));
+    if (version.dwOSVersionInfoSize < @sizeOf(OsVersionInfoW)) return 0;
+
+    var sp_major: u64 = 0;
+    var sp_minor: u64 = 0;
+    var suite_mask: u64 = 0;
+    var product_type: u64 = os_product_type;
+    if (version.dwOSVersionInfoSize >= @sizeOf(OsVersionInfoExW)) {
+        const ex: *const OsVersionInfoExW = @ptrCast(@alignCast(raw));
+        sp_major = ex.wServicePackMajor;
+        sp_minor = ex.wServicePackMinor;
+        suite_mask = ex.wSuiteMask;
+        product_type = ex.wProductType;
+    }
+
+    var satisfied = true;
+    if (type_mask & VER_MAJORVERSION != 0 and
+        !testCondition(conditionAt(condition_mask, 0), os_major, version.dwMajorVersion)) satisfied = false;
+    if (type_mask & VER_MINORVERSION != 0 and
+        !testCondition(conditionAt(condition_mask, 1), os_minor, version.dwMinorVersion)) satisfied = false;
+    if (type_mask & VER_BUILDNUMBER != 0 and
+        !testCondition(conditionAt(condition_mask, 2), os_build, version.dwBuildNumber)) satisfied = false;
+    if (type_mask & VER_PLATFORMID != 0 and
+        !testCondition(conditionAt(condition_mask, 3), os_platform_id, version.dwPlatformId)) satisfied = false;
+    if (type_mask & VER_SERVICEPACKMINOR != 0 and
+        !testCondition(conditionAt(condition_mask, 4), sp_minor, 0)) satisfied = false;
+    if (type_mask & VER_SERVICEPACKMAJOR != 0 and
+        !testCondition(conditionAt(condition_mask, 5), sp_major, 0)) satisfied = false;
+    if (type_mask & VER_SUITENAME != 0 and
+        !testCondition(conditionAt(condition_mask, 6), suite_mask, 0)) satisfied = false;
+    if (type_mask & VER_PRODUCT_TYPE != 0 and
+        !testCondition(conditionAt(condition_mask, 7), product_type, 0)) satisfied = false;
+
+    if (!satisfied) teb.setLastError(ERROR_OLD_WIN_VERSION);
+    return if (satisfied) 1 else 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,12 +167,12 @@ fn shim_DecodePointer(ptr: ?*anyopaque) callconv(win) ?*anyopaque {
     return ptr;
 }
 
-fn shim_FlsAlloc(_: ?*anyopaque) callconv(win) u32 {
-    return teb.tlsAlloc();
+fn shim_FlsAlloc(destructor: ?*anyopaque) callconv(win) u32 {
+    return teb.flsAlloc(if (destructor) |d| @intFromPtr(d) else 0);
 }
 
 fn shim_FlsFree(index: u32) callconv(win) i32 {
-    return if (teb.tlsFree(index)) 1 else 0;
+    return if (teb.flsFree(index)) 1 else 0;
 }
 
 fn shim_FlsGetValue(index: u32) callconv(win) ?*anyopaque {
@@ -763,6 +545,20 @@ fn shim_GetLocaleInfoEx(
     return text.len;
 }
 
+/// `IsValidCodePage`: the code pages this Windows 10 environment can serve.
+fn shim_IsValidCodePage(code_page: u32) callconv(win) i32 {
+    return switch (code_page) {
+        0, 437, 850, 852, 855, 857, 866, 869, 874 => 1,
+        932, 936, 949, 950 => 1,
+        1250, 1251, 1252, 1253, 1254, 1255, 1256, 1257, 1258 => 1,
+        10000, 10007, 20866, 20932, 21866, 28591, 28592, 28593, 28594, 28595 => 1,
+        28596, 28597, 28598, 28599 => 1,
+        20127, 28603, 28605, 50220, 50221, 50222, 50225, 50227, 51932, 51936 => 1,
+        51949, 52936, 54936, 65000, 65001 => 1,
+        else => 0,
+    };
+}
+
 fn shim_GetCPInfo(_: u32, out: ?[*]u8) callconv(win) i32 {
     const p = out orelse return 0;
     @memset(p[0..18], 0);
@@ -832,7 +628,6 @@ fn shim_XGameRuntimeInitializeWithOptions(_: ?*const anyopaque) callconv(win) i3
 
 fn shim_XGameRuntimeUninitialize() callconv(win) void {}
 
-
 extern "c" var stdin: *std.c.FILE;
 extern "c" var stdout: *std.c.FILE;
 extern "c" var stderr: *std.c.FILE;
@@ -898,16 +693,6 @@ fn shim_ldexp(x: f64, exp: c_int) callconv(win) f64 {
     return ldexp(x, exp);
 }
 
-fn wideToUtf8Z(w: ?[*:0]const u16, buf: *[2048]u8) [:0]const u8 {
-    const src = w orelse return "";
-    var tmp: [1024]u8 = undefined;
-    const n = std.unicode.utf16LeToUtf8(&tmp, std.mem.span(src)) catch return "";
-    if (n >= buf.len) return "";
-    @memcpy(buf[0..n], tmp[0..n]);
-    buf[n] = 0;
-    return buf[0..n :0];
-}
-
 fn shim__wfsopen(path: ?[*:0]const u16, mode: ?[*:0]const u16, _: c_int) callconv(win) ?*std.c.FILE {
     var mbuf: [32]u8 = undefined;
     var mlen: usize = 0;
@@ -935,17 +720,21 @@ const BeginThreadCtx = struct {
     arg: ?*anyopaque,
     handle: usize,
     stack_size: usize,
+    thread_ref: ?*anyopaque = null,
 };
 
 fn beginThreadBootstrap(ctx: BeginThreadCtx) void {
-    defer sync.markThreadExited(ctx.handle);
     if (builtin.os.tag == .linux) {
         var rsp: usize = undefined;
-        asm volatile ("movq %%rsp, %[out]" : [out] "=r" (rsp));
+        asm volatile ("movq %%rsp, %[out]"
+            : [out] "=r" (rsp),
+        );
         const base = rsp & ~@as(usize, 0xF);
         _ = teb.initThread(base, base - ctx.stack_size, @truncate(ctx.handle)) catch {};
     }
-    _ = ctx.start(ctx.arg);
+    thread_exit.setThreadRef(ctx.thread_ref);
+    const code = ctx.start(ctx.arg);
+    thread_exit.finish(code);
 }
 
 fn shim_beginthreadex(
@@ -961,12 +750,15 @@ fn shim_beginthreadex(
     const handle = sync.createThreadHandle(@truncate(@intFromPtr(start_fn)));
     if (handle == 0) return 0;
     if (thread_id) |out| out.* = @truncate(handle);
+    const thread_ref = sync.acquireThreadRef(handle);
     const thread = std.Thread.spawn(.{ .stack_size = size }, beginThreadBootstrap, .{BeginThreadCtx{
         .start = start_fn,
         .arg = arglist,
         .handle = handle,
         .stack_size = size,
+        .thread_ref = thread_ref,
     }}) catch {
+        if (thread_ref) |r| sync.releaseThreadRef(r);
         _ = sync.closeHandle(handle);
         return 0;
     };
@@ -975,24 +767,16 @@ fn shim_beginthreadex(
 }
 
 fn shim_endthreadex(code: u32) callconv(win) noreturn {
-    if (builtin.os.tag == .linux) std.os.linux.exit(@intCast(code));
-    std.process.exit(@truncate(code));
+    thread_exit.exitCurrent(code);
 }
 
 pub fn resolve(sym_name: []const u8) ?usize {
+    if (seh.resolve(sym_name)) |ptr| return ptr;
     const map = .{
-        .{ "RtlCaptureContext", @intFromPtr(&rtlCaptureContext) },
-        .{ "RtlLookupFunctionEntry", @intFromPtr(&shim_RtlLookupFunctionEntry) },
-        .{ "RtlPcToFileHeader", @intFromPtr(&shim_RtlPcToFileHeader) },
-        .{ "RtlVirtualUnwind", @intFromPtr(&shim_RtlVirtualUnwind) },
-        .{ "RtlUnwind", @intFromPtr(&shim_RtlUnwind) },
-        .{ "RtlUnwindEx", @intFromPtr(&shim_RtlUnwindEx) },
-        .{ "RaiseException", @intFromPtr(&shim_RaiseException) },
-        .{ "SetUnhandledExceptionFilter", @intFromPtr(&shim_SetUnhandledExceptionFilter) },
-        .{ "UnhandledExceptionFilter", @intFromPtr(&shim_UnhandledExceptionFilter) },
-        .{ "AddVectoredExceptionHandler", @intFromPtr(&shim_AddVectoredExceptionHandler) },
-        .{ "RemoveVectoredExceptionHandler", @intFromPtr(&shim_RemoveVectoredExceptionHandler) },
         .{ "IsDebuggerPresent", @intFromPtr(&shim_IsDebuggerPresent) },
+        .{ "IsThreadAFiber", @intFromPtr(&shim_IsThreadAFiber) },
+        .{ "VerSetConditionMask", @intFromPtr(&shim_VerSetConditionMask) },
+        .{ "VerifyVersionInfoW", @intFromPtr(&shim_VerifyVersionInfoW) },
         .{ "EncodePointer", @intFromPtr(&shim_EncodePointer) },
         .{ "DecodePointer", @intFromPtr(&shim_DecodePointer) },
         .{ "FlsAlloc", @intFromPtr(&shim_FlsAlloc) },
@@ -1051,6 +835,7 @@ pub fn resolve(sym_name: []const u8) ?usize {
         .{ "CompareStringEx", @intFromPtr(&shim_CompareStringEx) },
         .{ "LCMapStringEx", @intFromPtr(&shim_LCMapStringEx) },
         .{ "GetLocaleInfoEx", @intFromPtr(&shim_GetLocaleInfoEx) },
+        .{ "IsValidCodePage", @intFromPtr(&shim_IsValidCodePage) },
         .{ "GetCPInfo", @intFromPtr(&shim_GetCPInfo) },
         .{ "GetStringTypeW", @intFromPtr(&shim_GetStringTypeW) },
         .{ "__acrt_iob_func", @intFromPtr(&shim_acrt_iob_func) },
@@ -1071,79 +856,4 @@ pub fn resolve(sym_name: []const u8) ?usize {
         if (std.mem.eql(u8, entry.@"0", sym_name)) return entry.@"1";
     }
     return null;
-}
-
-test "RtlVirtualUnwind undoes a small stack allocation" {
-    var image: [0x200]u8 = @splat(0);
-    const image_base = @intFromPtr(&image);
-
-    // UNWIND_INFO at RVA 0x100: version 1, one UWOP_ALLOC_SMALL(3) at prolog 4.
-    image[0x100] = 0x01; // version 1, flags 0
-    image[0x101] = 0x04; // SizeOfProlog
-    image[0x102] = 0x01; // CountOfCodes
-    image[0x103] = 0x00; // FrameRegister/Offset
-    image[0x104] = 0x04; // code offset
-    image[0x105] = 0x23; // UWOP_ALLOC_SMALL, op_info 3 => 0x20 bytes
-
-    var stack: [0x200]u8 align(16) = @splat(0);
-    const entry_rsp = @intFromPtr(&stack) + 0x100;
-    const return_addr: u64 = 0x140001234;
-    std.mem.writeInt(u64, stack[0x100..][0..8], return_addr, .little);
-
-    var ctx = Context{};
-    ctx.rsp = entry_rsp - 0x20;
-
-    const fe = module.RuntimeFunction{ .begin = 0x1000, .end = 0x2000, .unwind = 0x100 };
-    var handler_data: ?*anyopaque = null;
-    var establisher: u64 = 0;
-    const handler = shim_RtlVirtualUnwind(
-        0,
-        image_base,
-        image_base + 0x1000,
-        &fe,
-        &ctx,
-        &handler_data,
-        &establisher,
-        null,
-    );
-
-    try std.testing.expect(handler == null);
-    try std.testing.expectEqual(@as(u64, entry_rsp), establisher);
-    try std.testing.expectEqual(return_addr, ctx.rip);
-    try std.testing.expectEqual(@as(u64, entry_rsp + 8), ctx.rsp);
-}
-
-test "RtlVirtualUnwind reports the exception handler" {
-    var image: [0x200]u8 = @splat(0);
-    const image_base = @intFromPtr(&image);
-
-    image[0x100] = 0x09; // version 1, UNW_FLAG_EHANDLER (0x1 << 3)
-    image[0x101] = 0x00;
-    image[0x102] = 0x00;
-    image[0x103] = 0x00;
-    std.mem.writeInt(u32, image[0x104..][0..4], 0x80, .little); // handler RVA
-
-    var stack: [0x100]u8 align(16) = @splat(0);
-    const rsp = @intFromPtr(&stack) + 0x80;
-    std.mem.writeInt(u64, stack[0x80..][0..8], 0x140005678, .little);
-
-    var ctx = Context{};
-    ctx.rsp = rsp;
-    const fe = module.RuntimeFunction{ .begin = 0x1000, .end = 0x2000, .unwind = 0x100 };
-    var handler_data: ?*anyopaque = null;
-    var establisher: u64 = 0;
-    const handler = shim_RtlVirtualUnwind(
-        0,
-        image_base,
-        image_base + 0x1000,
-        &fe,
-        &ctx,
-        &handler_data,
-        &establisher,
-        null,
-    );
-
-    try std.testing.expect(handler != null);
-    try std.testing.expectEqual(image_base + 0x80, @intFromPtr(handler.?));
-    try std.testing.expectEqual(image_base + 0x108, @intFromPtr(handler_data.?));
 }

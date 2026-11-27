@@ -3,15 +3,10 @@ const builtin = @import("builtin");
 const teb = @import("../teb.zig");
 const sync = @import("../sync.zig");
 const mod = @import("../module.zig");
+const thread_exit = @import("../thread_exit.zig");
 const host_imports = @import("../host_imports.zig");
 const xgameruntime_min = @import("xgameruntime_min.zig");
 const audio_min = @import("audio_min.zig");
-const audio_register = @import("audio_register.zig");
-
-const c_mmap = struct {
-    extern "c" fn mmap(addr: ?*anyopaque, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) ?*anyopaque;
-    extern "c" fn munmap(addr: ?*anyopaque, len: usize) c_int;
-};
 
 const WinFn = *const fn () callconv(.{ .x86_64_win = .{} }) void;
 const WinInitFn = *const fn () callconv(.{ .x86_64_win = .{} }) c_int;
@@ -29,12 +24,10 @@ fn noteThreadFailure() void {
 }
 var g_fmode: c_int = 0;
 var g_app_type: c_int = 2; // _crt_gui_app
-var next_handle: usize = 0x10000;
+var g_next_guest_tid = std.atomic.Value(u32).init(0x1_0000);
 
-fn allocDummyHandle() usize {
-    const h = next_handle;
-    next_handle += 8;
-    return h;
+fn allocGuestThreadId() u32 {
+    return g_next_guest_tid.fetchAdd(1, .monotonic);
 }
 
 fn logWideStr(prefix: []const u8, wptr: ?[*:0]const u16) void {
@@ -145,11 +138,11 @@ fn shim_IsProcessorFeaturePresent(feature: u32) callconv(.{ .x86_64_win = .{} })
 
 fn isSystemDllName(name: []const u8) bool {
     const exact = [_][]const u8{
-        "kernel32.dll", "ntdll.dll", "user32.dll", "advapi32.dll",
-        "bcrypt.dll", "ws2_32.dll", "winhttp.dll", "mfplat.dll",
-        "mfreadwrite.dll", "gameinput.dll", "xmem.dll", "chad.dll",
-        "d3d12_xs.dll", "xg_xs.dll", "xapu.dll", "acphal.dll", "xcrdapi.dll",
-        "bink2scarlett.dll", "libhttpclient.gdk.dll", "xgameruntime.dll",
+        "kernel32.dll",    "ntdll.dll",         "user32.dll",            "advapi32.dll",
+        "bcrypt.dll",      "ws2_32.dll",        "winhttp.dll",           "mfplat.dll",
+        "mfreadwrite.dll", "gameinput.dll",     "xmem.dll",              "chad.dll",
+        "d3d12_xs.dll",    "xg_xs.dll",         "xapu.dll",              "acphal.dll",
+        "xcrdapi.dll",     "bink2scarlett.dll", "libhttpclient.gdk.dll", "xgameruntime.dll",
     };
     for (exact) |e| {
         if (std.ascii.eqlIgnoreCase(name, e)) return true;
@@ -159,6 +152,31 @@ fn isSystemDllName(name: []const u8) bool {
 }
 
 const PSEUDO_SYSTEM_BASE: usize = 0x7FFE_0000;
+
+fn shim_VirtualProtect(addr: ?*anyopaque, size: usize, new_protect: u32, old_protect: *u32) callconv(.{ .x86_64_win = .{} }) i32 {
+    old_protect.* = 0x04;
+    if (builtin.os.tag == .linux) {
+        const c = struct {
+            extern "c" fn mprotect(addr: usize, len: usize, prot: i32) i32;
+        };
+        if (addr == null or size == 0) return 0;
+        const base = @intFromPtr(addr);
+        const page = base & ~@as(usize, 0xFFF);
+        const end = (base + size + 0xFFF) & ~@as(usize, 0xFFF);
+        // Keep pages executable; HLE code may restore/execute after a protect.
+        old_protect.* = 0x20;
+        return if (c.mprotect(page, end - page, 0x7) == 0) 1 else 0;
+    }
+    const c = struct {
+        extern "kernel32" fn VirtualProtect(?*anyopaque, usize, u32, *u32) callconv(.winapi) i32;
+    };
+    return c.VirtualProtect(addr, size, new_protect, old_protect);
+}
+
+fn shim_AppPolicyGetProcessTerminationMethod(_: ?*anyopaque, policy: *u32) callconv(.{ .x86_64_win = .{} }) i32 {
+    policy.* = 0; // AppPolicyProcessTerminationMethod_ExitProcess
+    return 0;
+}
 
 fn shim_GetModuleHandleW(module_name: ?[*:0]const u16) callconv(.{ .x86_64_win = .{} }) usize {
     if (module_name) |name| {
@@ -240,6 +258,389 @@ fn shim_GetProcAddress(hmodule: usize, proc_name: ?[*:0]const u8) callconv(.{ .x
     return 0;
 }
 
+/// `SystemFunction036` / `RtlGenRandom`: fill a buffer with cryptographically
+/// strong random bytes from the host kernel.
+fn shim_SystemFunction036(buffer: ?*anyopaque, len: u32) callconv(.{ .x86_64_win = .{} }) u8 {
+    const out: [*]u8 = @ptrCast(buffer orelse return 0);
+    if (len == 0) return 1;
+    if (builtin.os.tag != .linux) return 0;
+    var filled: usize = 0;
+    while (filled < len) {
+        const res = std.os.linux.syscall3(.getrandom, @intFromPtr(out + filled), len - filled, 0);
+        const signed: isize = @bitCast(res);
+        if (signed <= 0) return 0;
+        filled += @intCast(signed);
+    }
+    return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Headless windowing (ntuser ANSI API sets)
+// ---------------------------------------------------------------------------
+//
+// The loader has no Win32 window station/desktop.  Classes and windows are
+// modelled headlessly, but unlike the old empty message queue this registry
+// stores the WNDPROC and synthesizes the create/size/activate/paint messages
+// the engine's pump expects.  PeekMessageA returns them; DispatchMessageA
+// routes them to the registered procedure.
+
+pub const WNDCLASSEXA = extern struct {
+    cbSize: u32,
+    style: u32,
+    lpfnWndProc: usize,
+    cbClsExtra: i32,
+    cbWndExtra: i32,
+    hInstance: usize,
+    hIcon: usize,
+    hCursor: usize,
+    hbrBackground: usize,
+    lpszMenuName: ?[*:0]const u8,
+    lpszClassName: ?[*:0]const u8,
+    hIconSm: usize,
+};
+
+/// Win32 `MSG` on x64 (48 bytes).
+pub const MSG = extern struct {
+    hwnd: usize,
+    message: u32,
+    reserved: u32,
+    wparam: usize,
+    lparam: isize,
+    time: u32,
+    pt_x: i32,
+    pt_y: i32,
+    lprivate: u32,
+};
+
+/// Win32 `CREATESTRUCTA` on x64 (80 bytes).
+pub const CREATESTRUCTA = extern struct {
+    lpCreateParams: usize,
+    hInstance: usize,
+    hMenu: usize,
+    hwndParent: usize,
+    cy: i32,
+    cx: i32,
+    y: i32,
+    x: i32,
+    style: i32,
+    lpszName: ?[*:0]const u8,
+    lpszClass: ?[*:0]const u8,
+    dwExStyle: u32,
+};
+
+const WM_NCCREATE: u32 = 0x0081;
+const WM_CREATE: u32 = 0x0001;
+const WM_SIZE: u32 = 0x0005;
+const WM_ACTIVATE: u32 = 0x0006;
+const WM_PAINT: u32 = 0x000F;
+const WM_ERASEBKGND: u32 = 0x0014;
+const SIZE_RESTORED: u32 = 0;
+const WA_ACTIVE: u32 = 1;
+const CLIENT_WIDTH: i32 = 1280;
+const CLIENT_HEIGHT: i32 = 720;
+
+const MAX_WINDOW_CLASSES = 32;
+const MAX_WINDOWS = 64;
+const MAX_MESSAGES = 128;
+const ATOM_BASE: u16 = 0xC000;
+const ERROR_INVALID_PARAMETER: u32 = 87;
+const ERROR_CLASS_ALREADY_EXISTS: u32 = 1410;
+const ERROR_CLASS_DOES_NOT_EXIST: u32 = 1407;
+
+const WindowClass = struct {
+    name: [64]u8 = undefined,
+    name_len: u8 = 0,
+    wndproc: usize = 0,
+    hinstance: usize = 0,
+    style: u32 = 0,
+    background: usize = 0,
+};
+
+const Window = struct {
+    in_use: bool = false,
+    hwnd: usize = 0,
+    class_index: usize = 0,
+    wndproc: usize = 0,
+    hinstance: usize = 0,
+    visible: bool = false,
+    active: bool = false,
+    width: i32 = CLIENT_WIDTH,
+    height: i32 = CLIENT_HEIGHT,
+    title: [64]u8 = undefined,
+    title_len: u8 = 0,
+    create: CREATESTRUCTA = std.mem.zeroes(CREATESTRUCTA),
+};
+
+var g_window_classes: [MAX_WINDOW_CLASSES]WindowClass = undefined;
+var g_window_class_count: usize = 0;
+var g_windows: [MAX_WINDOWS]Window = @splat(.{});
+var g_messages: [MAX_MESSAGES]MSG = undefined;
+var g_message_count: usize = 0;
+var g_next_window: usize = 1;
+var g_window_lock = std.atomic.Value(u8).init(0);
+
+fn lockWindows() void {
+    while (g_window_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+}
+fn unlockWindows() void {
+    g_window_lock.store(0, .release);
+}
+
+fn classNameEql(existing: *const WindowClass, name: []const u8) bool {
+    return existing.name_len == name.len and std.mem.eql(u8, existing.name[0..name.len], name);
+}
+
+fn findClassUnlocked(name: []const u8) ?usize {
+    for (g_window_classes[0..g_window_class_count], 0..) |*entry, i| {
+        if (classNameEql(entry, name)) return i;
+    }
+    return null;
+}
+
+fn findWindowUnlocked(hwnd: usize) ?*Window {
+    for (&g_windows) |*w| {
+        if (w.in_use and w.hwnd == hwnd) return w;
+    }
+    return null;
+}
+
+fn monotonicMillis() u32 {
+    if (comptime builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
+        return @truncate(@as(u64, @intCast(ts.sec)) * 1000 + @as(u64, @intCast(@divTrunc(ts.nsec, 1_000_000))));
+    }
+    return 0;
+}
+
+fn queueMessageUnlocked(hwnd: usize, message: u32, wparam: usize, lparam: isize) void {
+    if (g_message_count >= g_messages.len) {
+        // Keep the oldest messages rather than silently dropping new ones at
+        // the head; a full headless queue is a loader bug.
+        std.log.warn("[WINDOW] message queue full; dropping msg 0x{x}", .{message});
+        return;
+    }
+    g_messages[g_message_count] = .{
+        .hwnd = hwnd,
+        .message = message,
+        .reserved = 0,
+        .wparam = wparam,
+        .lparam = lparam,
+        .time = monotonicMillis(),
+        .pt_x = 0,
+        .pt_y = 0,
+        .lprivate = 0,
+    };
+    g_message_count += 1;
+}
+
+fn shim_RegisterClassExA(wc: ?*const WNDCLASSEXA) callconv(.{ .x86_64_win = .{} }) u16 {
+    const window_class = wc orelse {
+        teb.setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if (window_class.cbSize != @sizeOf(WNDCLASSEXA)) {
+        teb.setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    const name_ptr = window_class.lpszClassName orelse {
+        teb.setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    const name = std.mem.span(name_ptr);
+    if (name.len == 0 or name.len >= 64) {
+        teb.setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    lockWindows();
+    defer unlockWindows();
+    if (findClassUnlocked(name) != null) {
+        teb.setLastError(ERROR_CLASS_ALREADY_EXISTS);
+        return 0; // Win32: existing class is FALSE + ERROR_CLASS_ALREADY_EXISTS
+    }
+    if (g_window_class_count >= MAX_WINDOW_CLASSES) {
+        teb.setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    const index = g_window_class_count;
+    const entry = &g_window_classes[index];
+    @memcpy(entry.name[0..name.len], name);
+    entry.name[name.len] = 0;
+    entry.name_len = @intCast(name.len);
+    entry.wndproc = window_class.lpfnWndProc;
+    entry.hinstance = window_class.hInstance;
+    entry.style = window_class.style;
+    entry.background = window_class.hbrBackground;
+    g_window_class_count += 1;
+    const atom = ATOM_BASE + @as(u16, @intCast(index));
+    std.log.info("[WINDOW] RegisterClassExA(\"{s}\") -> atom 0x{x}, wndproc=0x{x}", .{
+        name, atom, window_class.lpfnWndProc,
+    });
+    return atom;
+}
+
+fn shim_CreateWindowExA(
+    _: u32,
+    class_name: ?[*:0]const u8,
+    window_name: ?[*:0]const u8,
+    style: u32,
+    _: i32,
+    _: i32,
+    _: i32,
+    _: i32,
+    _: usize,
+    _: usize,
+    hinstance: usize,
+    lp_param: ?*anyopaque,
+) callconv(.{ .x86_64_win = .{} }) usize {
+    const class_ptr = class_name orelse {
+        teb.setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    const class_text = std.mem.span(class_ptr);
+    lockWindows();
+    defer unlockWindows();
+    const class_index = findClassUnlocked(class_text) orelse {
+        teb.setLastError(ERROR_CLASS_DOES_NOT_EXIST);
+        return 0;
+    };
+    var slot: ?*Window = null;
+    for (&g_windows) |*w| {
+        if (!w.in_use) {
+            slot = w;
+            break;
+        }
+    }
+    const w = slot orelse {
+        teb.setLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    const cls = &g_window_classes[class_index];
+    const handle = 0x0001_0000 + g_next_window;
+    g_next_window += 1;
+
+    w.* = .{
+        .in_use = true,
+        .hwnd = handle,
+        .class_index = class_index,
+        .wndproc = cls.wndproc,
+        .hinstance = if (hinstance != 0) hinstance else cls.hinstance,
+        .visible = false,
+        .active = true,
+        .width = CLIENT_WIDTH,
+        .height = CLIENT_HEIGHT,
+    };
+    const title = window_name orelse @as([*:0]const u8, "");
+    const title_text = std.mem.span(title);
+    const title_len = @min(title_text.len, w.title.len - 1);
+    @memcpy(w.title[0..title_len], title_text[0..title_len]);
+    w.title[title_len] = 0;
+    w.title_len = @intCast(title_len);
+
+    w.create = .{
+        .lpCreateParams = if (lp_param) |p| @intFromPtr(p) else 0,
+        .hInstance = w.hinstance,
+        .hMenu = 0,
+        .hwndParent = 0,
+        .cy = CLIENT_HEIGHT,
+        .cx = CLIENT_WIDTH,
+        .y = 0,
+        .x = 0,
+        .style = @intCast(style),
+        .lpszName = @ptrCast(&w.title),
+        .lpszClass = @ptrCast(&cls.name),
+        .dwExStyle = 0,
+    };
+
+    // These messages are delivered by PeekMessageA in this order.
+    queueMessageUnlocked(handle, WM_NCCREATE, 0, @intCast(@intFromPtr(&w.create)));
+    queueMessageUnlocked(handle, WM_CREATE, 0, @intCast(@intFromPtr(&w.create)));
+    queueMessageUnlocked(handle, WM_SIZE, SIZE_RESTORED, (@as(isize, CLIENT_HEIGHT) << 16) | @as(isize, CLIENT_WIDTH));
+    queueMessageUnlocked(handle, WM_ACTIVATE, WA_ACTIVE, 0);
+    queueMessageUnlocked(handle, WM_PAINT, 0, 0);
+
+    std.log.info("[WINDOW] CreateWindowExA(class=\"{s}\", title=\"{s}\") -> hwnd 0x{x} ({d}x{d})", .{
+        class_text, title_text, handle, CLIENT_WIDTH, CLIENT_HEIGHT,
+    });
+    return handle;
+}
+
+fn shim_ShowWindow(hwnd: usize, cmd: i32) callconv(.{ .x86_64_win = .{} }) i32 {
+    lockWindows();
+    defer unlockWindows();
+    const w = findWindowUnlocked(hwnd) orelse return 0;
+    const previous: i32 = if (w.visible) 1 else 0;
+    w.visible = cmd != 0; // SW_HIDE == 0
+    return previous;
+}
+
+fn shim_DefWindowProcA(_: usize, message: u32, _: usize, _: usize) callconv(.{ .x86_64_win = .{} }) isize {
+    return switch (message) {
+        WM_NCCREATE => 1,
+        WM_ERASEBKGND => 1,
+        else => 0,
+    };
+}
+
+fn shim_PeekMessageA(
+    msg: ?*MSG,
+    hwnd: usize,
+    filter_min: u32,
+    filter_max: u32,
+    remove: u32,
+) callconv(.{ .x86_64_win = .{} }) i32 {
+    const out = msg orelse return 0;
+    lockWindows();
+    defer unlockWindows();
+    var i: usize = 0;
+    while (i < g_message_count) : (i += 1) {
+        const candidate = g_messages[i];
+        if (hwnd != 0 and candidate.hwnd != hwnd) continue;
+        if (filter_min != 0 or filter_max != 0) {
+            if (candidate.message < filter_min or candidate.message > filter_max) continue;
+        }
+        out.* = candidate;
+        if ((remove & 1) != 0) { // PM_REMOVE
+            var j = i;
+            while (j + 1 < g_message_count) : (j += 1) g_messages[j] = g_messages[j + 1];
+            g_message_count -= 1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+fn shim_DispatchMessageA(msg: ?*const MSG) callconv(.{ .x86_64_win = .{} }) isize {
+    const m = msg orelse return 0;
+    lockWindows();
+    const w = findWindowUnlocked(m.hwnd);
+    const proc = if (w) |win| win.wndproc else 0;
+    unlockWindows();
+    if (proc == 0) return 0;
+    const WndProc = *const fn (usize, u32, usize, isize) callconv(.{ .x86_64_win = .{} }) isize;
+    const f: WndProc = @ptrFromInt(proc);
+    return f(m.hwnd, m.message, m.wparam, m.lparam);
+}
+
+fn shim_TranslateMessage(msg: ?*const MSG) callconv(.{ .x86_64_win = .{} }) i32 {
+    _ = msg;
+    // No keyboard-to-character translation is synthesized; returning 0 is
+    // truthful (no WM_CHAR was posted).
+    return 0;
+}
+
+/// Test hook: clear classes, windows and queued messages.
+pub fn resetWindowStateForTest() void {
+    lockWindows();
+    defer unlockWindows();
+    g_window_class_count = 0;
+    g_message_count = 0;
+    g_next_window = 1;
+    for (&g_windows) |*w| w.in_use = false;
+}
+
 fn shim_RegOpenKeyW(hKey: usize, lpSubKey: ?[*:0]const u16, phkResult: ?*usize) callconv(.{ .x86_64_win = .{} }) i32 {
     _ = hKey;
     _ = phkResult;
@@ -284,124 +685,8 @@ fn shim_RegCloseKey(hKey: usize) callconv(.{ .x86_64_win = .{} }) i32 {
     return 0;
 }
 
-fn shim_CreateSemaphoreW(
-    security_attrs: ?*anyopaque,
-    initial_count: i32,
-    maximum_count: i32,
-    name: ?[*:0]const u16,
-) callconv(.{ .x86_64_win = .{} }) usize {
-    _ = security_attrs;
-    _ = initial_count;
-    _ = maximum_count;
-    _ = name;
-    return allocDummyHandle();
-}
-
-fn shim_CreateSemaphoreExW(
-    security_attrs: ?*anyopaque,
-    initial_count: i32,
-    maximum_count: i32,
-    name: ?[*:0]const u16,
-    flags: u32,
-    desired_access: u32,
-) callconv(.{ .x86_64_win = .{} }) usize {
-    _ = security_attrs;
-    _ = initial_count;
-    _ = maximum_count;
-    _ = name;
-    _ = flags;
-    _ = desired_access;
-    return allocDummyHandle();
-}
-
-fn shim_ReleaseSemaphore(handle: usize, release_count: i32, previous_count: ?*i32) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = handle;
-    _ = release_count;
-    if (previous_count) |prev| prev.* = 0;
-    return 1;
-}
-
-fn shim_CreateMutexW(
-    security_attrs: ?*anyopaque,
-    initial_owner: i32,
-    name: ?[*:0]const u16,
-) callconv(.{ .x86_64_win = .{} }) usize {
-    _ = security_attrs;
-    _ = initial_owner;
-    _ = name;
-    return allocDummyHandle();
-}
-
-fn shim_CreateMutexExW(
-    security_attrs: ?*anyopaque,
-    name: ?[*:0]const u16,
-    flags: u32,
-    desired_access: u32,
-) callconv(.{ .x86_64_win = .{} }) usize {
-    _ = security_attrs;
-    _ = name;
-    _ = flags;
-    _ = desired_access;
-    return allocDummyHandle();
-}
-
-fn shim_ReleaseMutex(handle: usize) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = handle;
-    return 1;
-}
-
-fn shim_InitializeConditionVariable(cv: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = cv;
-}
-
-fn shim_SleepConditionVariableCS(cv: ?*anyopaque, cs: ?*anyopaque, ms: u32) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = cv;
-    _ = cs;
-    _ = ms;
-    return 1;
-}
-
-fn shim_SleepConditionVariableSRW(cv: ?*anyopaque, srw: ?*anyopaque, ms: u32, flags: u32) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = cv;
-    _ = srw;
-    _ = ms;
-    _ = flags;
-    return 1;
-}
-
-fn shim_WakeConditionVariable(cv: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = cv;
-}
-
-fn shim_WakeAllConditionVariable(cv: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = cv;
-}
-
-fn shim_InitializeSRWLock(srw: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = srw;
-}
-
-fn shim_AcquireSRWLockExclusive(srw: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = srw;
-}
-
-fn shim_ReleaseSRWLockExclusive(srw: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = srw;
-}
-
-fn shim_AcquireSRWLockShared(srw: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = srw;
-}
-
-fn shim_ReleaseSRWLockShared(srw: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = srw;
-}
-
-
-
 fn shim_ExitThread(code: u32) callconv(.{ .x86_64_win = .{} }) noreturn {
-    if (builtin.os.tag == .windows) std.log.warn("[TERM] ExitThread(0x{x})", .{code});
-    std.process.exit(@truncate(code));
+    thread_exit.exitCurrent(code);
 }
 
 fn shim_TerminateThread(handle: ?*anyopaque, code: u32) callconv(.{ .x86_64_win = .{} }) i32 {
@@ -410,9 +695,7 @@ fn shim_TerminateThread(handle: ?*anyopaque, code: u32) callconv(.{ .x86_64_win 
     return 1;
 }
 
-
 threadlocal var g_rand_state: u32 = 1;
-
 
 fn shim_abort() callconv(.{ .x86_64_win = .{} }) noreturn {
     if (builtin.os.tag == .linux) std.log.err("[ABORT] CRT abort() called by engine", .{});
@@ -425,10 +708,6 @@ fn shim_terminate() callconv(.{ .x86_64_win = .{} }) noreturn {
 }
 
 fn shim_srand(seed: u32) callconv(.{ .x86_64_win = .{} }) void {
-    if (builtin.os.tag == .linux) {
-        std.log.err("[SRAND] seed={d}", .{seed});
-        std.process.exit(0);
-    }
     g_rand_state = seed;
 }
 
@@ -447,94 +726,6 @@ fn shim_TerminateProcess(handle: ?*anyopaque, code: u32) callconv(.{ .x86_64_win
 fn shim_RtlExitUserProcess(code: u32) callconv(.{ .x86_64_win = .{} }) noreturn {
     if (builtin.os.tag == .windows) std.log.warn("[TERM] RtlExitUserProcess(0x{x})", .{code});
     std.process.exit(@truncate(code));
-}
-
-fn shim_InitializeCriticalSectionAndSpinCount(cs: ?*anyopaque, spin_count: u32) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = cs;
-    _ = spin_count;
-    return 1;
-}
-
-fn shim_InitializeCriticalSectionEx(cs: ?*anyopaque, spin_count: u32, flags: u32) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = cs;
-    _ = spin_count;
-    _ = flags;
-    return 1;
-}
-
-fn shim_CreateEventW(
-    security_attrs: ?*anyopaque,
-    manual_reset: i32,
-    initial_state: i32,
-    name: ?[*:0]const u16,
-) callconv(.{ .x86_64_win = .{} }) usize {
-    _ = security_attrs;
-    _ = manual_reset;
-    _ = initial_state;
-    _ = name;
-    return allocDummyHandle();
-}
-
-fn shim_CreateEventA(
-    security_attrs: ?*anyopaque,
-    manual_reset: i32,
-    initial_state: i32,
-    name: ?[*:0]const u8,
-) callconv(.{ .x86_64_win = .{} }) usize {
-    _ = security_attrs;
-    _ = manual_reset;
-    _ = initial_state;
-    _ = name;
-    return allocDummyHandle();
-}
-
-fn shim_SetEvent(handle: usize) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = handle;
-    return 1;
-}
-
-fn shim_ResetEvent(handle: usize) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = handle;
-    return 1;
-}
-
-fn shim_WaitForSingleObject(handle: usize, milliseconds: u32) callconv(.{ .x86_64_win = .{} }) u32 {
-    _ = handle;
-    _ = milliseconds;
-    return 0;
-}
-
-fn shim_WaitForSingleObjectEx(handle: usize, milliseconds: u32, alertable: i32) callconv(.{ .x86_64_win = .{} }) u32 {
-    _ = handle;
-    _ = milliseconds;
-    _ = alertable;
-    return 0;
-}
-
-fn shim_CloseHandle(handle: usize) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = handle;
-    return 1;
-}
-
-fn shim_WaitOnAddress(
-    address: *const anyopaque,
-    compare_address: *const anyopaque,
-    address_size: usize,
-    milliseconds: u32,
-) callconv(.{ .x86_64_win = .{} }) i32 {
-    _ = address;
-    _ = compare_address;
-    _ = address_size;
-    _ = milliseconds;
-    return 1;
-}
-
-fn shim_WakeByAddressSingle(address: *const anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = address;
-}
-
-fn shim_WakeByAddressAll(address: *const anyopaque) callconv(.{ .x86_64_win = .{} }) void {
-    _ = address;
 }
 
 fn shim_QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.{ .x86_64_win = .{} }) i32 {
@@ -571,10 +762,43 @@ fn shim_GetCurrentThreadId() callconv(.{ .x86_64_win = .{} }) u32 {
     return 1001;
 }
 
+fn shim_GetCurrentThread() callconv(.{ .x86_64_win = .{} }) usize {
+    return sync.CURRENT_THREAD_HANDLE;
+}
+
+fn shim_GetProcessId(handle: usize) callconv(.{ .x86_64_win = .{} }) u32 {
+    if (handle == @as(usize, @bitCast(@as(isize, -1)))) {
+        if (teb.process()) |p| return p.pid;
+        return shim_GetCurrentProcessId();
+    }
+    teb.setLastError(sync.ERROR_INVALID_HANDLE);
+    return 0;
+}
+
+fn shim_GetCurrentThreadStackLimits(low: ?*usize, high: ?*usize) callconv(.{ .x86_64_win = .{} }) void {
+    const bounds = teb.stackBounds() orelse {
+        if (low) |p| p.* = 0;
+        if (high) |p| p.* = 0;
+        return;
+    };
+    if (low) |p| p.* = bounds.limit;
+    if (high) |p| p.* = bounds.base;
+}
+
 fn shim_GetCurrentProcessId() callconv(.{ .x86_64_win = .{} }) u32 {
     if (teb.currentTeb()) |t| return @truncate(t.client_id.unique_process);
     if (builtin.os.tag == .linux) return @bitCast(std.os.linux.getpid());
     return 1000;
+}
+
+/// ANSI code page of the guest Windows environment.
+fn shim_GetACP() callconv(.{ .x86_64_win = .{} }) u32 {
+    return 1252;
+}
+
+/// OEM code page of the guest Windows environment.
+fn shim_GetOEMCP() callconv(.{ .x86_64_win = .{} }) u32 {
+    return 437;
 }
 
 fn shim_malloc(size: usize) callconv(.{ .x86_64_win = .{} }) ?*anyopaque {
@@ -670,10 +894,6 @@ fn shim_GetActiveProcessorCount(group_number: u16) callconv(.{ .x86_64_win = .{}
 }
 
 const cmd_line_a: [*:0]const u8 = "game_scarlett_master.exe";
-const cmd_line_w = [_:0]u16{
-    'g', 'a', 'm', 'e', '_', 's', 'c', 'a', 'r', 'l', 'e', 't', 't', '_',
-    'm', 'a', 's', 't', 'e', 'r', '.', 'e', 'x', 'e',
-};
 
 fn shim_GetCommandLineA() callconv(.{ .x86_64_win = .{} }) [*:0]const u8 {
     return teb.commandLineA().ptr;
@@ -793,15 +1013,17 @@ fn shim_LoadLibraryExW(lpLibFileName: ?[*:0]const u16, hFile: usize, dwFlags: u3
 
 fn shim_InitializeApiImpl(reserved: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
     _ = reserved;
-    std.log.info("[GDK] InitializeApiImpl() -> S_OK", .{});
-    return 0;
+    const hr = xgameruntime_min.initialize(xgameruntime_min.SUPPORTED_GDK_VERSION);
+    std.log.info("[GDK] InitializeApiImpl() -> 0x{x}", .{@as(u32, @bitCast(hr))});
+    return hr;
 }
 
 fn shim_InitializeApiImplEx(options: ?*const anyopaque, reserved: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) i32 {
     _ = options;
     _ = reserved;
-    std.log.info("[GDK] InitializeApiImplEx() -> S_OK", .{});
-    return 0;
+    const hr = xgameruntime_min.initialize(xgameruntime_min.SUPPORTED_GDK_VERSION);
+    std.log.info("[GDK] InitializeApiImplEx() -> 0x{x}", .{@as(u32, @bitCast(hr))});
+    return hr;
 }
 
 fn shim_InitializeApiImplEx2(
@@ -811,11 +1033,15 @@ fn shim_InitializeApiImplEx2(
 ) callconv(.{ .x86_64_win = .{} }) i32 {
     _ = options;
     _ = reserved;
-    std.log.info("[GDK] InitializeApiImplEx2(version=0x{x}) -> S_OK", .{version});
-    return 0;
+    const hr = xgameruntime_min.initialize(version);
+    std.log.info("[GDK] InitializeApiImplEx2(version=0x{x}, build={d}) -> 0x{x}", .{
+        version, @as(u32, @truncate(version >> 32)), @as(u32, @bitCast(hr)),
+    });
+    return hr;
 }
 
 fn shim_UninitializeApiImpl() callconv(.{ .x86_64_win = .{} }) void {
+    xgameruntime_min.uninitialize();
     std.log.info("[GDK] UninitializeApiImpl()", .{});
 }
 
@@ -848,6 +1074,10 @@ fn shim_QueryApiImpl(
         }
     }
     if (ppv) |out| out.* = null;
+    if (!xgameruntime_min.isInitialized()) {
+        std.log.warn("[GDK] QueryApiImpl before a supported InitializeApiImpl call", .{});
+        return xgameruntime_min.CO_E_NOTINITIALIZED;
+    }
     if (rclsid) |g| {
         if (xgameruntime_min.queryApi(
             @ptrCast(@alignCast(g)),
@@ -874,9 +1104,6 @@ fn shim_p_argv() callconv(.{ .x86_64_win = .{} }) *usize {
     return &g_argv_storage;
 }
 
-pub var g_tls_block_addr: usize = 0;
-pub var g_main_tls_addr: usize = 0;
-
 const WinThreadProc = *const fn (?*anyopaque) callconv(.{ .x86_64_win = .{} }) u32;
 
 const ThreadSpawnCtx = struct {
@@ -885,96 +1112,184 @@ const ThreadSpawnCtx = struct {
     tid: u32,
     stack_size: usize,
     handle: usize,
+    /// Acquired reference to this thread's sync handle object; the exit path
+    /// publishes the exit code through it (see thread_exit.zig).
+    thread_ref: ?*anyopaque = null,
+    gate: ?*ThreadGate = null,
 };
 
-const LinuxThreadCtx = struct {
-    spawn: ThreadSpawnCtx,
-    ptid: i32 = 0,
-    ctid: i32 = 0,
+/// CreateThread(CREATE_SUSPENDED) must not run the guest entry (or the CRT's
+/// thread-attach callbacks) until ResumeThread drops the suspend count to
+/// zero.  Each created thread gets a gate kept in a small static table keyed
+/// by the guest's thread handle.
+const ThreadGate = struct {
+    handle: usize = 0,
+    running: std.atomic.Value(u32) = std.atomic.Value(u32).init(1),
+    suspend_count: u32 = 0,
 };
 
-fn linuxCloneEntry(arg: usize) callconv(.c) u8 {
-    const c: *LinuxThreadCtx = @ptrFromInt(arg);
-    threadBootstrap(c.spawn);
-    return 0;
+const MAX_THREAD_GATES = 128;
+var g_gates: [MAX_THREAD_GATES]ThreadGate = @splat(.{});
+var g_gate_lock = std.atomic.Value(u8).init(0);
+
+fn lockGates() void {
+    while (g_gate_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
 }
 
-/// pthread_create's stack handling either commits memory (ENOMEM on an
-/// over-committed host) or rejects a supplied stack (EINVAL).  Raw clone with
-/// a MAP_NORESERVE stack avoids both.  FS/TLS is inherited from the caller.
-fn spawnLinuxThread(stack_size: usize, spawn_ctx: ThreadSpawnCtx) !void {
-    const page: usize = 4096;
-    const total = std.mem.alignForward(usize, @max(stack_size, 256 * 1024) + page, page);
-    const PROT_READ: i32 = 1;
-    const PROT_WRITE: i32 = 2;
-    const MAP_PRIVATE: i32 = 2;
-    const MAP_ANONYMOUS: i32 = 0x20;
-    const MAP_NORESERVE: i32 = 0x4000;
-    const MAP_FAILED: usize = @bitCast(@as(isize, -1));
+fn unlockGates() void {
+    g_gate_lock.store(0, .release);
+}
 
-    const mem = c_mmap.mmap(null, total, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0) orelse return error.SystemResources;
-    if (@intFromPtr(mem) == MAP_FAILED) return error.SystemResources;
-
-    const ctx = std.heap.c_allocator.create(LinuxThreadCtx) catch {
-        _ = c_mmap.munmap(mem, total);
-        return error.OutOfMemory;
-    };
-    ctx.* = .{ .spawn = spawn_ctx };
-
-    const flags: u32 = std.os.linux.CLONE.VM |
-        std.os.linux.CLONE.FS |
-        std.os.linux.CLONE.FILES |
-        std.os.linux.CLONE.SIGHAND |
-        std.os.linux.CLONE.THREAD |
-        std.os.linux.CLONE.SYSVSEM |
-        std.os.linux.CLONE.PARENT_SETTID |
-        std.os.linux.CLONE.CHILD_CLEARTID;
-
-    const stack_top = @intFromPtr(mem) + total;
-    const rc = std.os.linux.clone(
-        &linuxCloneEntry,
-        stack_top,
-        flags,
-        @intFromPtr(ctx),
-        &ctx.ptid,
-        0,
-        &ctx.ctid,
-    );
-    const signed: isize = @bitCast(rc);
-    if (signed < 0) {
-        std.log.err("[THREAD] clone failed: errno={d} stack=0x{x} size=0x{x}", .{ -signed, @intFromPtr(mem), total });
-        std.heap.c_allocator.destroy(ctx);
-        _ = c_mmap.munmap(mem, total);
-        return switch (-signed) {
-            11 => error.SystemResources, // EAGAIN
-            12 => error.OutOfMemory, // ENOMEM
-            else => error.Unexpected,
+fn allocGate(handle: usize, suspended: bool) ?*ThreadGate {
+    lockGates();
+    defer unlockGates();
+    for (&g_gates) |*g| {
+        if (g.handle != 0) continue;
+        g.* = .{
+            .handle = handle,
+            .running = std.atomic.Value(u32).init(if (suspended) 0 else 1),
+            .suspend_count = if (suspended) 1 else 0,
         };
+        return g;
     }
-    // The stack and ctx belong to the child now; they are intentionally leaked
-    // because a detached thread cannot unmap the stack it is running on.
+    return null;
+}
+
+fn findGate(handle: usize) ?*ThreadGate {
+    lockGates();
+    defer unlockGates();
+    for (&g_gates) |*g| {
+        if (g.handle == handle) return g;
+    }
+    return null;
+}
+
+fn releaseGate(handle: usize) void {
+    lockGates();
+    defer unlockGates();
+    for (&g_gates) |*g| {
+        if (g.handle == handle) {
+            g.* = .{};
+            return;
+        }
+    }
+}
+
+fn waitForResume(gate: *ThreadGate) void {
+    while (gate.running.load(.acquire) == 0) {
+        var req = std.os.linux.timespec{ .sec = 0, .nsec = 1_000_000 };
+        _ = std.os.linux.nanosleep(&req, null);
+    }
+}
+
+/// Guest threads must run on a host thread with its own TLS block: glibc keeps
+/// `errno` and the malloc `tcache` in TLS, so inheriting the creator's FS base
+/// (as a raw `clone` without CLONE_SETTLS does) makes concurrent guest heap
+/// calls corrupt the host allocator.  pthread_create allocates a fresh TLS
+/// area for the child.
+const PthreadArgs = struct {
+    ctx: ThreadSpawnCtx,
+};
+
+fn pthreadEntry(raw: ?*anyopaque) callconv(.c) ?*anyopaque {
+    const args: *PthreadArgs = @ptrCast(@alignCast(raw orelse return null));
+    const ctx = args.ctx;
+    std.heap.c_allocator.destroy(args);
+    threadBootstrap(ctx);
+    return null;
+}
+
+const pthread_getattr_np = struct {
+    extern "c" fn pthread_getattr_np(thread: std.c.pthread_t, attr: *std.c.pthread_attr_t) c_int;
+}.pthread_getattr_np;
+const pthread_attr_getstack = struct {
+    extern "c" fn pthread_attr_getstack(attr: *const std.c.pthread_attr_t, stackaddr: *?*anyopaque, stacksize: *usize) c_int;
+}.pthread_attr_getstack;
+
+/// The host stack top of the current thread (the highest valid stack address).
+/// Linux-only: on Windows the host TEB already describes the thread stack.
+fn hostStackTop() ?usize {
+    if (builtin.os.tag == .linux) {
+        var attr: std.c.pthread_attr_t = undefined;
+        if (pthread_getattr_np(std.c.pthread_self(), &attr) != 0) return null;
+        defer _ = std.c.pthread_attr_destroy(&attr);
+        var addr: ?*anyopaque = null;
+        var size: usize = 0;
+        if (pthread_attr_getstack(&attr, &addr, &size) != 0) return null;
+        const base: usize = @intFromPtr(addr);
+        if (base == 0 or size == 0) return null;
+        return base + size;
+    }
+    return null;
+}
+
+fn spawnLinuxThread(stack_size: usize, spawn_ctx: ThreadSpawnCtx) !void {
+    const args = std.heap.c_allocator.create(PthreadArgs) catch return error.OutOfMemory;
+    args.* = .{ .ctx = spawn_ctx };
+
+    // Default pthread stack unless the guest asked for more than the default:
+    // host libc rejects explicit stack sizes below 1 MiB with EINVAL, and the
+    // guest's own __chkstk enforces the requested size via the TEB StackLimit.
+    var attr: std.c.pthread_attr_t = undefined;
+    var use_attr = false;
+    if (stack_size > 1024 * 1024) {
+        if (std.c.pthread_attr_init(&attr) != .SUCCESS) {
+            std.heap.c_allocator.destroy(args);
+            return error.SystemResources;
+        }
+        use_attr = true;
+        const size = std.mem.alignForward(usize, stack_size, 4096);
+        _ = std.c.pthread_attr_setstacksize(&attr, size);
+    }
+    defer if (use_attr) {
+        _ = std.c.pthread_attr_destroy(&attr);
+    };
+
+    var handle: std.c.pthread_t = undefined;
+    const rc = std.c.pthread_create(&handle, if (use_attr) &attr else null, pthreadEntry, args);
+    if (rc != .SUCCESS) {
+        std.heap.c_allocator.destroy(args);
+        std.log.err("[THREAD] pthread_create failed: {s} size=0x{x}", .{ @tagName(rc), stack_size });
+        return error.SystemResources;
+    }
+    _ = std.c.pthread_detach(handle);
 }
 
 fn threadBootstrap(ctx: ThreadSpawnCtx) void {
     defer _ = g_thread_count.fetchSub(1, .monotonic);
-    defer sync.markThreadExited(ctx.handle);
+    defer releaseGate(ctx.handle);
+    // CREATE_SUSPENDED: the guest entry and the CRT thread-attach callbacks do
+    // not run until ResumeThread has dropped the suspend count to zero.
+    if (ctx.gate) |g| waitForResume(g);
 
     if (builtin.os.tag == .linux or builtin.os.tag == .windows) {
-        var rsp: usize = undefined;
-        asm volatile ("movq %%rsp, %[out]" : [out] "=r" (rsp));
-        const stack_base = rsp & ~@as(usize, 0xF);
+        var stack_base: usize = 0;
+        if (hostStackTop()) |top| {
+            // High end of this thread's host stack.
+            stack_base = top;
+        } else {
+            var rsp: usize = undefined;
+            asm volatile ("movq %%rsp, %[out]"
+                : [out] "=r" (rsp),
+            );
+            stack_base = rsp & ~@as(usize, 0xF);
+        }
+        // The guest's requested stack size is enforced by guest __chkstk
+        // through TEB.StackLimit, independent of the host stack size.
         const stack_size = if (ctx.stack_size != 0) ctx.stack_size else 1024 * 1024;
         _ = teb.initThread(stack_base, stack_base - stack_size, ctx.tid) catch {};
     }
 
+    thread_exit.setThreadRef(ctx.thread_ref);
     if (mod.thread_attach_fn) |f| f();
-    defer {
-        if (mod.thread_detach_fn) |f| f();
-    }
 
     teb.enterGuest();
-    defer teb.leaveGuest();
-    _ = ctx.start_fn(ctx.param);
+    const code = ctx.start_fn(ctx.param);
+    // Normal thread return: DLL_THREAD_DETACH, FLS destructors, exit code,
+    // TEB/TLS release.  (ExitThread/_endthreadex use the same path.)
+    thread_exit.finish(code);
 }
 
 const WinStartFn = *const fn (?*anyopaque) callconv(.winapi) u32;
@@ -1005,18 +1320,8 @@ fn shim_CreateThread(
     thread_id: ?*u32,
 ) callconv(.{ .x86_64_win = .{} }) usize {
     _ = security_attrs;
-    _ = creation_flags;
     const func = start_address orelse return 0;
-    if (builtin.os.tag == .linux) {
-        const mgr = @as(*const usize, @ptrFromInt(0x1_498d_4b30));
-        if (mgr.* == 0) {
-            const init_manager = @as(*const fn () callconv(.{ .x86_64_win = .{} }) void, @ptrFromInt(0x1_45b5_6d10));
-            init_manager();
-        }
-        _ = audio_register.mountAudioPack();
-    }
-    const serial = allocDummyHandle();
-    const tid: u32 = @truncate(serial);
+    const tid: u32 = allocGuestThreadId();
     if (thread_id) |tid_out| tid_out.* = tid;
 
     const live = g_thread_count.fetchAdd(1, .monotonic);
@@ -1026,21 +1331,30 @@ fn shim_CreateThread(
         return 0;
     }
 
-    const requested_stack: usize = if (stack_size_arg != 0) stack_size_arg else 1024 * 1024;
+    // CreateThread(0) uses the process default (the executable's
+    // SizeOfStackReserve); the guest TEB limit always reflects the request.
+    const requested_stack: usize = if (stack_size_arg != 0)
+        @min(stack_size_arg, 64 * 1024 * 1024)
+    else
+        teb.processStackReserve();
     const stack_size: usize = @min(requested_stack, 8 * 1024 * 1024);
 
     const log_index = g_thread_logs.fetchAdd(1, .monotonic);
     if (log_index < 24 or log_index % 64 == 0) {
-        std.log.info("[THREAD] CreateThread(entry=0x{x}, tid={d}, handle=0x{x}, live={d}, stack=0x{x})", .{
-            @intFromPtr(func), tid, handle, live, requested_stack,
+        std.log.info("[THREAD] CreateThread(entry=0x{x}, tid={d}, handle=0x{x}, live={d}, stack=0x{x}, flags=0x{x})", .{
+            @intFromPtr(func), tid, handle, live, requested_stack, creation_flags,
         });
     }
+    const suspended = (creation_flags & CREATE_SUSPENDED) != 0;
+    const gate = allocGate(handle, suspended);
     const spawn_ctx = ThreadSpawnCtx{
         .start_fn = func,
         .param = parameter,
         .tid = tid,
         .stack_size = stack_size,
         .handle = handle,
+        .thread_ref = sync.acquireThreadRef(handle),
+        .gate = gate,
     };
 
     if (builtin.os.tag == .linux) {
@@ -1048,6 +1362,8 @@ fn shim_CreateThread(
             _ = g_thread_count.fetchSub(1, .monotonic);
             std.log.err("[THREAD] spawn failed for tid={d}: {s}", .{ tid, @errorName(err) });
             noteThreadFailure();
+            releaseGate(handle);
+            if (spawn_ctx.thread_ref) |r| sync.releaseThreadRef(r);
             _ = sync.closeHandle(handle);
             return 0;
         };
@@ -1064,6 +1380,8 @@ fn shim_CreateThread(
         std.heap.c_allocator.destroy(ctx);
         _ = g_thread_count.fetchSub(1, .monotonic);
         noteThreadFailure();
+        releaseGate(handle);
+        if (spawn_ctx.thread_ref) |r| sync.releaseThreadRef(r);
         _ = sync.closeHandle(handle);
         return 0;
     };
@@ -1198,15 +1516,27 @@ fn shim_wfopen(filename: ?[*:0]const u16, mode: ?[*:0]const u16) callconv(.{ .x8
     return null;
 }
 
-fn shim_EnterCriticalSection(_: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {}
-fn shim_LeaveCriticalSection(_: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {}
-fn shim_InitializeCriticalSection(_: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {}
-fn shim_DeleteCriticalSection(_: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) void {}
 fn shim_SetThreadPriority(_: usize, _: c_int) callconv(.{ .x86_64_win = .{} }) i32 {
     return 1;
 }
-fn shim_ResumeThread(_: usize) callconv(.{ .x86_64_win = .{} }) u32 {
-    return 0;
+const CREATE_SUSPENDED: u32 = 0x0000_0004;
+
+fn shim_ResumeThread(handle: usize) callconv(.{ .x86_64_win = .{} }) u32 {
+    const gate = findGate(handle) orelse return 0xFFFF_FFFF;
+    const previous = gate.suspend_count;
+    if (previous != 0) {
+        gate.suspend_count = previous - 1;
+        if (gate.suspend_count == 0) gate.running.store(1, .release);
+    }
+    return previous;
+}
+
+fn shim_SuspendThread(handle: usize) callconv(.{ .x86_64_win = .{} }) u32 {
+    const gate = findGate(handle) orelse return 0xFFFF_FFFF;
+    const previous = gate.suspend_count;
+    gate.suspend_count = previous + 1;
+    gate.running.store(0, .release);
+    return previous;
 }
 fn shim_GetThreadGroupAffinity(_: usize, affinity: ?[*]u8) callconv(.{ .x86_64_win = .{} }) i32 {
     if (affinity) |a| {
@@ -1238,17 +1568,6 @@ fn shim_InitializeSListHead(list_head: ?*anyopaque) callconv(.{ .x86_64_win = .{
     if (addr < 0x10000) return;
     const bytes: [*]u8 = @ptrFromInt(addr);
     @memset(bytes[0..16], 0);
-}
-
-fn shim_CreateMutexA(
-    security_attrs: ?*anyopaque,
-    initial_owner: i32,
-    name: ?[*:0]const u8,
-) callconv(.{ .x86_64_win = .{} }) usize {
-    _ = security_attrs;
-    _ = initial_owner;
-    _ = name;
-    return allocDummyHandle();
 }
 
 fn shim_TlsAlloc() callconv(.{ .x86_64_win = .{} }) u32 {
@@ -1330,6 +1649,22 @@ fn shim_HeapReAlloc(heap: usize, flags: u32, mem: ?*anyopaque, bytes: usize) cal
     return std.c.realloc(mem, @max(bytes, 1));
 }
 
+/// Guest heap blocks are host libc allocations, so the usable size is what
+/// the host allocator reports.  UCRT's `_realloc_base`/`_free_base` use this
+/// to validate blocks; returning 0 made them take a bogus slow path.
+fn shim_HeapSize(heap: usize, flags: u32, mem: ?*anyopaque) callconv(.{ .x86_64_win = .{} }) usize {
+    _ = heap;
+    _ = flags;
+    const ptr = mem orelse return 0;
+    if (builtin.os.tag == .linux) {
+        const libc = struct {
+            extern "c" fn malloc_usable_size(ptr: ?*anyopaque) usize;
+        };
+        return libc.malloc_usable_size(ptr);
+    }
+    return 0;
+}
+
 pub fn resolve(sym_name: []const u8) ?usize {
     const map = .{
         .{ "_initterm", @intFromPtr(&shim_initterm) },
@@ -1358,45 +1693,35 @@ pub fn resolve(sym_name: []const u8) ?usize {
         .{ "_initialize_narrow_environment", @intFromPtr(&shim_initialize_narrow_environment) },
         .{ "IsProcessorFeaturePresent", @intFromPtr(&shim_IsProcessorFeaturePresent) },
         .{ "GetModuleHandleW", @intFromPtr(&shim_GetModuleHandleW) },
+        .{ "VirtualProtect", @intFromPtr(&shim_VirtualProtect) },
+        .{ "AppPolicyGetProcessTerminationMethod", @intFromPtr(&shim_AppPolicyGetProcessTerminationMethod) },
         .{ "GetModuleHandleA", @intFromPtr(&shim_GetModuleHandleA) },
         .{ "GetProcAddress", @intFromPtr(&shim_GetProcAddress) },
+        .{ "RegisterClassExA", @intFromPtr(&shim_RegisterClassExA) },
+        .{ "CreateWindowExA", @intFromPtr(&shim_CreateWindowExA) },
+        .{ "ShowWindow", @intFromPtr(&shim_ShowWindow) },
+        .{ "DefWindowProcA", @intFromPtr(&shim_DefWindowProcA) },
+        .{ "PeekMessageA", @intFromPtr(&shim_PeekMessageA) },
+        .{ "DispatchMessageA", @intFromPtr(&shim_DispatchMessageA) },
+        .{ "TranslateMessage", @intFromPtr(&shim_TranslateMessage) },
+        .{ "SystemFunction036", @intFromPtr(&shim_SystemFunction036) },
+        .{ "RtlGenRandom", @intFromPtr(&shim_SystemFunction036) },
         .{ "RegOpenKeyW", @intFromPtr(&shim_RegOpenKeyW) },
         .{ "RegOpenKeyExW", @intFromPtr(&shim_RegOpenKeyExW) },
         .{ "RegQueryValueExW", @intFromPtr(&shim_RegQueryValueExW) },
         .{ "RegCloseKey", @intFromPtr(&shim_RegCloseKey) },
-        .{ "CreateSemaphoreW", @intFromPtr(&shim_CreateSemaphoreW) },
-        .{ "CreateSemaphoreExW", @intFromPtr(&shim_CreateSemaphoreExW) },
-        .{ "ReleaseSemaphore", @intFromPtr(&shim_ReleaseSemaphore) },
-        .{ "CreateMutexW", @intFromPtr(&shim_CreateMutexW) },
-        .{ "CreateMutexExW", @intFromPtr(&shim_CreateMutexExW) },
-        .{ "ReleaseMutex", @intFromPtr(&shim_ReleaseMutex) },
-        .{ "InitializeConditionVariable", @intFromPtr(&shim_InitializeConditionVariable) },
-        .{ "SleepConditionVariableCS", @intFromPtr(&shim_SleepConditionVariableCS) },
-        .{ "SleepConditionVariableSRW", @intFromPtr(&shim_SleepConditionVariableSRW) },
-        .{ "WakeConditionVariable", @intFromPtr(&shim_WakeConditionVariable) },
-        .{ "WakeAllConditionVariable", @intFromPtr(&shim_WakeAllConditionVariable) },
-        .{ "InitializeSRWLock", @intFromPtr(&shim_InitializeSRWLock) },
-        .{ "AcquireSRWLockExclusive", @intFromPtr(&shim_AcquireSRWLockExclusive) },
-        .{ "ReleaseSRWLockExclusive", @intFromPtr(&shim_ReleaseSRWLockExclusive) },
-        .{ "AcquireSRWLockShared", @intFromPtr(&shim_AcquireSRWLockShared) },
-        .{ "ReleaseSRWLockShared", @intFromPtr(&shim_ReleaseSRWLockShared) },
-        .{ "InitializeCriticalSectionAndSpinCount", @intFromPtr(&shim_InitializeCriticalSectionAndSpinCount) },
-        .{ "InitializeCriticalSectionEx", @intFromPtr(&shim_InitializeCriticalSectionEx) },
-        .{ "CreateEventW", @intFromPtr(&shim_CreateEventW) },
-        .{ "CreateEventA", @intFromPtr(&shim_CreateEventA) },
-        .{ "SetEvent", @intFromPtr(&shim_SetEvent) },
-        .{ "ResetEvent", @intFromPtr(&shim_ResetEvent) },
-        .{ "WaitForSingleObject", @intFromPtr(&shim_WaitForSingleObject) },
-        .{ "WaitForSingleObjectEx", @intFromPtr(&shim_WaitForSingleObjectEx) },
-        .{ "CloseHandle", @intFromPtr(&shim_CloseHandle) },
-        .{ "WaitOnAddress", @intFromPtr(&shim_WaitOnAddress) },
-        .{ "WakeByAddressSingle", @intFromPtr(&shim_WakeByAddressSingle) },
-        .{ "WakeByAddressAll", @intFromPtr(&shim_WakeByAddressAll) },
         .{ "QueryPerformanceCounter", @intFromPtr(&shim_QueryPerformanceCounter) },
         .{ "QueryPerformanceFrequency", @intFromPtr(&shim_QueryPerformanceFrequency) },
         .{ "GetSystemTimeAsFileTime", @intFromPtr(&shim_GetSystemTimeAsFileTime) },
+        // Same semantics; the precise variant writes the same FILETIME.
+        .{ "GetSystemTimePreciseAsFileTime", @intFromPtr(&shim_GetSystemTimeAsFileTime) },
         .{ "GetCurrentThreadId", @intFromPtr(&shim_GetCurrentThreadId) },
+        .{ "GetCurrentThread", @intFromPtr(&shim_GetCurrentThread) },
+        .{ "GetCurrentThreadStackLimits", @intFromPtr(&shim_GetCurrentThreadStackLimits) },
         .{ "GetCurrentProcessId", @intFromPtr(&shim_GetCurrentProcessId) },
+        .{ "GetProcessId", @intFromPtr(&shim_GetProcessId) },
+        .{ "GetACP", @intFromPtr(&shim_GetACP) },
+        .{ "GetOEMCP", @intFromPtr(&shim_GetOEMCP) },
         .{ "malloc", @intFromPtr(&shim_malloc) },
         .{ "calloc", @intFromPtr(&shim_calloc) },
         .{ "realloc", @intFromPtr(&shim_realloc) },
@@ -1463,18 +1788,14 @@ pub fn resolve(sym_name: []const u8) ?usize {
         .{ "strrchr", @intFromPtr(&shim_strrchr) },
         .{ "strncmp", @intFromPtr(&shim_strncmp) },
         .{ "_wfopen", @intFromPtr(&shim_wfopen) },
-        .{ "EnterCriticalSection", @intFromPtr(&shim_EnterCriticalSection) },
-        .{ "LeaveCriticalSection", @intFromPtr(&shim_LeaveCriticalSection) },
-        .{ "InitializeCriticalSection", @intFromPtr(&shim_InitializeCriticalSection) },
-        .{ "DeleteCriticalSection", @intFromPtr(&shim_DeleteCriticalSection) },
         .{ "SetThreadPriority", @intFromPtr(&shim_SetThreadPriority) },
         .{ "ResumeThread", @intFromPtr(&shim_ResumeThread) },
+        .{ "SuspendThread", @intFromPtr(&shim_SuspendThread) },
         .{ "GetThreadGroupAffinity", @intFromPtr(&shim_GetThreadGroupAffinity) },
         .{ "SetThreadGroupAffinity", @intFromPtr(&shim_SetThreadGroupAffinity) },
         .{ "GetLocalTime", @intFromPtr(&shim_GetLocalTime) },
         .{ "_purecall", @intFromPtr(&shim_purecall) },
         .{ "InitializeSListHead", @intFromPtr(&shim_InitializeSListHead) },
-        .{ "CreateMutexA", @intFromPtr(&shim_CreateMutexA) },
         .{ "TlsAlloc", @intFromPtr(&shim_TlsAlloc) },
         .{ "TlsFree", @intFromPtr(&shim_TlsFree) },
         .{ "TlsGetValue", @intFromPtr(&shim_TlsGetValue) },
@@ -1490,6 +1811,7 @@ pub fn resolve(sym_name: []const u8) ?usize {
         .{ "HeapAlloc", @intFromPtr(&shim_HeapAlloc) },
         .{ "HeapFree", @intFromPtr(&shim_HeapFree) },
         .{ "HeapReAlloc", @intFromPtr(&shim_HeapReAlloc) },
+        .{ "HeapSize", @intFromPtr(&shim_HeapSize) },
         .{ "LoadLibraryExA", @intFromPtr(&shim_LoadLibraryExA) },
         .{ "FreeLibrary", @intFromPtr(&shim_FreeLibrary) },
         .{ "GetModuleFileNameA", @intFromPtr(&shim_GetModuleFileNameA) },

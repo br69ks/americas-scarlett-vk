@@ -2,8 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const teb = @import("teb.zig");
 const loader = @import("loader.zig");
-const module = @import("module.zig");
-const crt_core = @import("shims/crt_core.zig");
 const audio_register = @import("shims/audio_register.zig");
 const win32_fs = @import("shims/win32_fs.zig");
 
@@ -115,15 +113,6 @@ pub fn main(init: std.process.Init) !void {
     var loaded = try loader.loadExecutable(allocator, io, exe_abs, virtual_exe);
     defer loaded.image.deinit();
     signals.setImage(loaded.image.base_addr, loaded.image.image_size);
-    if (builtin.os.tag == .linux) {
-        const c = struct { extern "c" fn mprotect(addr: usize, len: usize, prot: i32) i32; };
-                                        _ = c.mprotect(0x143751000, 0x1000, 0x7);
-        // Mark the game's GDK version as supported in the version struct.
-        @as([*]u8, @ptrFromInt(0x143751f71))[0] = 0xC6;
-        @as([*]u8, @ptrFromInt(0x143751f72))[0] = 0x46;
-        @as([*]u8, @ptrFromInt(0x143751f73))[0] = 0x24;
-        @as([*]u8, @ptrFromInt(0x143751f74))[0] = 0x01;
-    }
 
     std.log.info("Image mapped at 0x{x}, entry point 0x{x}; TEB=0x{x}", .{
         loaded.image.base_addr,
@@ -144,16 +133,6 @@ pub fn main(init: std.process.Init) !void {
     std.log.info("[TLS] pre-entry idx_mem={d} mod_index={d} slot=0x{x}", .{
         idx_mem.*, loaded.mod.tls_index, teb.tlsGet(idx_mem.*),
     });
-    if (builtin.os.tag == .windows) {
-        const iat: *const usize = @ptrFromInt(0x146793ae8);
-        const v = iat.*;
-        const q: usize = if (v > 0x10000) @as(*const usize, @ptrFromInt(v + 0x78)).* else 0;
-        std.log.info("[IAT] spin runtime=0x{x} q78=0x{x}", .{ v, q });
-        const iat2: *const usize = @ptrFromInt(0x146793528);
-        const gv = iat2.*;
-        const gq: usize = if (gv > 0x10000) @as(*const usize, @ptrFromInt(gv + 0x78)).* else 0;
-        std.log.info("[IAT] gmh runtime=0x{x} q78=0x{x}", .{ gv, gq });
-    }
     std.log.info("[ENTRY] calling 0x{x}", .{loaded.image.entry_point});
     teb.forceGuest();
     const exit_code = entry_fn();
@@ -178,12 +157,18 @@ fn winLog(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptim
     var host: usize = 0;
     if (guest != 0 and cur == guest) {
         host = @as(*const usize, @ptrFromInt(guest + 0x1FF8)).*;
-        if (host >= 0x10000) asm volatile ("wrgsbase %[base]" :: [base] "r" (host));
+        if (host >= 0x10000) asm volatile ("wrgsbase %[base]"
+            :
+            : [base] "r" (host),
+        );
     }
     const h = k32.GetStdHandle(0xFFFFFFF4); // STD_ERROR_HANDLE
     var done: u32 = 0;
     _ = k32.WriteFile(h, text.ptr, @intCast(text.len), &done, null);
-    if (host >= 0x10000) asm volatile ("wrgsbase %[base]" :: [base] "r" (guest));
+    if (host >= 0x10000) asm volatile ("wrgsbase %[base]"
+        :
+        : [base] "r" (guest),
+    );
 }
 
 pub const std_options: std.Options = if (builtin.os.tag == .windows) .{ .logFn = winLog } else .{ .log_level = .info };

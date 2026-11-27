@@ -1,17 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const module = @import("module.zig");
-const teb = @import("teb.zig");
-const registry = @import("shims/generated/registry.zig");
-const crt_core = @import("shims/crt_core.zig");
-const xmem = @import("shims/xmem.zig");
-const game_input = @import("shims/game_input.zig");
-const dstorage = @import("shims/dstorage.zig");
-const win32_fs = @import("shims/win32_fs.zig");
-const sync_shims = @import("shims/sync_shims.zig");
-const crt_extra = @import("shims/crt_extra.zig");
-const wsa = @import("shims/wsa.zig");
 const host_imports = @import("host_imports.zig");
+const stub_policy = @import("shims/stub_policy.zig");
+const loader_lock = @import("loader_lock.zig");
 
 const c = if (builtin.os.tag == .windows) struct {
     extern "kernel32" fn VirtualAlloc(lpAddress: ?*anyopaque, dwSize: usize, flAllocationType: u32, flProtect: u32) callconv(.{ .x86_64_win = .{} }) ?*anyopaque;
@@ -47,6 +39,9 @@ pub const MappedImage = struct {
     tls_callbacks: usize,
     preferred_base: u64,
     is_dll: bool,
+    /// PE optional-header stack sizes (SizeOfStackReserve/SizeOfStackCommit).
+    stack_reserve: u64 = 0,
+    stack_commit: u64 = 0,
     import_dir: DataDirectory,
     export_dir: DataDirectory,
     pdata_rva: u32,
@@ -132,17 +127,36 @@ fn needsHostThunk(dll: []const u8) bool {
 }
 
 fn logUnimplementedCall(info: *const StubInfo, caller_ret: usize) callconv(.c) usize {
+    // Formatting-only CRT exports are optional by design (see stub_policy).
     if (std.mem.startsWith(u8, info.name, "__stdio_common_")) return 0;
-    std.log.warn("[CALL] {s}!{s} (from 0x{x})", .{ info.dll, info.name, caller_ret });
-    return 0;
+    std.log.err("[CALL] unimplemented {s}!{s} (from 0x{x}); failing closed", .{
+        info.dll, info.name, caller_ret,
+    });
+    // Not a silent zero return: unknown imports abort through the same
+    // fail-closed policy as the generated stubs (benign/optional APIs and
+    // SCARLETT_STUB_POLICY=zero still return 0 there).
+    return stub_policy.missing(info.dll, info.name);
 }
 
 pub const TrampolineArena = struct {
     base: [*]u8,
     capacity: usize,
     offset: usize = 0,
+    /// Serializes slot allocation: stubs may be emitted from import patching
+    /// (under the loader lock) and from guest `GetProcAddress` calls.
+    lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     const slot_size = 128;
+
+    fn lockSlot(self: *TrampolineArena) void {
+        while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            while (self.lock.load(.monotonic) != 0) std.atomic.spinLoopHint();
+        }
+    }
+
+    fn unlockSlot(self: *TrampolineArena) void {
+        self.lock.store(0, .release);
+    }
 
     pub fn init(capacity: usize) !TrampolineArena {
         const ptr = try allocExecutableImage(0, capacity);
@@ -150,6 +164,8 @@ pub const TrampolineArena = struct {
     }
 
     pub fn emitThunk(self: *TrampolineArena, target: usize) !usize {
+        self.lockSlot();
+        defer self.unlockSlot();
         if (self.offset + 128 > self.capacity) return error.OutOfMemory;
         const slot = self.base + self.offset;
         self.offset += 128;
@@ -160,19 +176,19 @@ pub const TrampolineArena = struct {
         const template = [_]u8{
             0x65, 0x4c, 0x8b, 0x1c, 0x25, 0x30, 0x00, 0x00, 0x00, // mov r11, gs:[0x30]
             0x4d, 0x8b, 0x94, 0x24, 0xf8, 0x1f, 0x00, 0x00, // mov r10, [r11+0x1ff8]
-            0x4d, 0x85, 0xd2,                               // test r10, r10
-            0x74, 0x30,                                     // jz no_host (0x46)
-            0x4d, 0x89, 0xa3, 0xf0, 0x1f, 0x00, 0x00,       // mov [r11+0x1ff0], r12
-            0x4d, 0x89, 0x9a, 0xe0, 0x1f, 0x00, 0x00,       // mov [r10+0x1fe0], r11
-            0xf3, 0x49, 0x0f, 0xae, 0xda,                   // wrgsbase r10
-            0xff, 0x15, 0x34, 0x00, 0x00, 0x00,             // call [rip+0x34] -> 0x60
+            0x4d, 0x85, 0xd2, // test r10, r10
+            0x74, 0x30, // jz no_host (0x46)
+            0x4d, 0x89, 0xa3, 0xf0, 0x1f, 0x00, 0x00, // mov [r11+0x1ff0], r12
+            0x4d, 0x89, 0x9a, 0xe0, 0x1f, 0x00, 0x00, // mov [r10+0x1fe0], r11
+            0xf3, 0x49, 0x0f, 0xae, 0xda, // wrgsbase r10
+            0xff, 0x15, 0x34, 0x00, 0x00, 0x00, // call [rip+0x34] -> 0x60
             0x65, 0x4c, 0x8b, 0x14, 0x25, 0x30, 0x00, 0x00, 0x00, // mov r10, gs:[0x30] (host)
-            0x4d, 0x8b, 0x9a, 0xe0, 0x1f, 0x00, 0x00,       // mov r11, [r10+0x1fe0]
-            0x4d, 0x8b, 0xa3, 0xf0, 0x1f, 0x00, 0x00,       // mov r12, [r11+0x1ff0]
-            0xf3, 0x49, 0x0f, 0xae, 0xde,                   // wrgsbase r11
-            0xc3,                                           // ret
-            0xff, 0x15, 0x14, 0x00, 0x00, 0x00,             // no_host: call [rip+0x14] -> 0x60
-            0xc3,                                           // ret
+            0x4d, 0x8b, 0x9a, 0xe0, 0x1f, 0x00, 0x00, // mov r11, [r10+0x1fe0]
+            0x4d, 0x8b, 0xa3, 0xf0, 0x1f, 0x00, 0x00, // mov r12, [r11+0x1ff0]
+            0xf3, 0x49, 0x0f, 0xae, 0xde, // wrgsbase r11
+            0xc3, // ret
+            0xff, 0x15, 0x14, 0x00, 0x00, 0x00, // no_host: call [rip+0x14] -> 0x60
+            0xc3, // ret
         };
         @memcpy(slot[0..template.len], &template);
         std.mem.writeInt(u64, slot[0x60..0x68], target, .little);
@@ -180,6 +196,8 @@ pub const TrampolineArena = struct {
     }
 
     fn emit(self: *TrampolineArena, allocator: std.mem.Allocator, dll: []const u8, name: []const u8) !usize {
+        self.lockSlot();
+        defer self.unlockSlot();
         if (self.offset + slot_size > self.capacity) return error.OutOfMemory;
 
         const info = try allocator.create(StubInfo);
@@ -226,7 +244,11 @@ pub const TrampolineArena = struct {
             emitBytes(slot, &p, &.{ 0x48, 0xBF });
             std.mem.writeInt(u64, slot[p..][0..8], info_addr, .little);
             p += 8;
-            emitBytes(slot, &p, &.{ 0x49, 0x89, 0xDE });
+            // Second argument is the guest return address captured in r11.
+            // (This used to be `mov r14, rbx`, which clobbered a callee-saved
+            // register of the calling guest function and passed a bogus
+            // caller_ret.)
+            emitBytes(slot, &p, &.{ 0x4C, 0x89, 0xDE });
             emitBytes(slot, &p, &.{ 0x48, 0xB8 });
             std.mem.writeInt(u64, slot[p..][0..8], logger_addr, .little);
             p += 8;
@@ -253,6 +275,17 @@ const IMAGE_DIRECTORY_ENTRY_IMPORT: usize = 1;
 const IMAGE_DIRECTORY_ENTRY_BASERELOC: usize = 5;
 const IMAGE_DIRECTORY_ENTRY_EXCEPTION: usize = 3;
 const IMAGE_DIRECTORY_ENTRY_TLS: usize = 9;
+
+pub const StackSizes = struct { reserve: u64, commit: u64 };
+
+/// PE32+ optional-header SizeOfStackReserve/SizeOfStackCommit.
+pub fn readStackSizes(opt_bytes: []const u8) StackSizes {
+    if (opt_bytes.len < 0x58) return .{ .reserve = 0, .commit = 0 };
+    return .{
+        .reserve = std.mem.readInt(u64, opt_bytes[0x48..0x50], .little),
+        .commit = std.mem.readInt(u64, opt_bytes[0x50..0x58], .little),
+    };
+}
 
 fn readDataDir(opt_bytes: []const u8, index: usize) DataDirectory {
     const off = 112 + index * 8;
@@ -289,6 +322,9 @@ pub fn mapImage(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Map
     const preferred_base = std.mem.readInt(u64, opt_bytes[24..32], .little);
     const size_of_image = std.mem.readInt(u32, opt_bytes[56..60], .little);
     const size_of_headers = std.mem.readInt(u32, opt_bytes[60..64], .little);
+    const stack_sizes = readStackSizes(opt_bytes);
+    const stack_reserve = stack_sizes.reserve;
+    const stack_commit = stack_sizes.commit;
 
     if (size_of_image == 0 or size_of_image > 0x4000_0000) return error.InvalidImageSize;
     if (size_of_headers > size_of_image) return error.InvalidHeaders;
@@ -336,15 +372,19 @@ pub fn mapImage(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Map
         const zero_fill = std.mem.readInt(u32, tls_hdr[32..36], .little);
 
         const raw_len: usize = if (end_va >= start_va) @intCast(end_va - start_va) else 0;
-        const total_tls_size: usize = raw_len + @as(usize, zero_fill) + 0x1000;
-        const tls_mem = try allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(64), total_tls_size);
-        @memset(tls_mem, 0);
-        if (raw_len > 0 and start_va != 0) {
-            const src_ptr: [*]const u8 = @ptrFromInt(@as(usize, @intCast(start_va)));
-            @memcpy(tls_mem[0..raw_len], src_ptr[0..raw_len]);
+        // Exactly the module's declared TLS size (raw template + zero fill);
+        // the old +0x1000 slack is gone.
+        const total_tls_size: usize = raw_len + @as(usize, zero_fill);
+        if (total_tls_size > 0) {
+            const tls_mem = try allocator.alignedAlloc(u8, comptime std.mem.Alignment.fromByteUnits(64), total_tls_size);
+            @memset(tls_mem, 0);
+            if (raw_len > 0 and start_va != 0) {
+                const src_ptr: [*]const u8 = @ptrFromInt(@as(usize, @intCast(start_va)));
+                @memcpy(tls_mem[0..raw_len], src_ptr[0..raw_len]);
+            }
+            tls_block_addr = @intFromPtr(tls_mem.ptr);
+            tls_block_size = total_tls_size;
         }
-        tls_block_addr = @intFromPtr(tls_mem.ptr);
-        tls_block_size = total_tls_size;
         tls_index_va = @intCast(index_va);
         tls_callbacks = @intCast(callbacks_va);
         std.log.info("TLS block: addr=0x{x}, raw={d}, zero_fill={d}, index_va=0x{x}", .{
@@ -364,6 +404,8 @@ pub fn mapImage(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Map
         .tls_callbacks = tls_callbacks,
         .preferred_base = preferred_base,
         .is_dll = (file_hdr.characteristics & 0x2000) != 0,
+        .stack_reserve = stack_reserve,
+        .stack_commit = stack_commit,
         .import_dir = import_dir,
         .export_dir = export_dir,
         .pdata_rva = pdata_dir.virtual_address,
@@ -430,6 +472,10 @@ pub const ImportStats = struct {
 
 pub fn patchImports(image: *const MappedImage, resolver: ImportResolver) !ImportStats {
     if (image.import_dir.virtual_address == 0) return .{};
+    // Import patching may load dependent modules (which patch their own
+    // imports); the loader lock is recursive.
+    loader_lock.lock();
+    defer loader_lock.unlock();
     const base: [*]u8 = @ptrFromInt(image.base_addr);
     const import_dir = image.import_dir;
     var stats = ImportStats{};
@@ -498,50 +544,6 @@ pub fn patchImports(image: *const MappedImage, resolver: ImportResolver) !Import
     return stats;
 }
 
-fn globalResolve(_: *anyopaque, dll: []const u8, name: ?[]const u8, ordinal: ?u16) ?usize {
-    if (host_imports.resolve(dll, name, ordinal)) |ptr| return ptr;
-    if (ordinal) |ord| {
-        if (std.ascii.eqlIgnoreCase(dll, "gameinput.dll") and ord == 1) {
-            return @intFromPtr(&game_input.shim_GameInputCreate);
-        }
-        if (wsa.resolveOrdinal(dll, ord)) |ptr| return ptr;
-        return registry.resolve(dll, null, ord);
-    }
-    const n = name orelse return null;
-    if (sync_shims.resolve(n)) |ptr| return ptr;
-    if (crt_core.resolve(n)) |ptr| return ptr;
-    if (crt_extra.resolve(n)) |ptr| return ptr;
-    if (xmem.resolve(n)) |ptr| return ptr;
-    if (dstorage.resolve(n)) |ptr| return ptr;
-    if (win32_fs.resolve(n)) |ptr| return ptr;
-    if (wsa.resolve(n)) |ptr| return ptr;
-    return registry.resolve(dll, n, null);
-}
-
-/// Legacy entry point: map the executable, resolve imports with the built-in
-/// shim chain, and fall back to logging trampolines for unknown imports.
-pub fn loadAndPatch(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !MappedImage {
-    var image = try mapImage(allocator, io, path);
-    errdefer image.deinit();
-
-    var arena = try TrampolineArena.init(512 * 1024);
-    image.trampoline_page = arena.base;
-    image.trampoline_page_size = 512 * 1024;
-
-    _ = try patchImports(&image, .{
-        .ctx = undefined,
-        .resolve = globalResolve,
-        .arena = &arena,
-        .allocator = allocator,
-    });
-
-    if (image.tls_index_va != 0) {
-        const idx_ptr: *u32 = @ptrFromInt(image.tls_index_va);
-        idx_ptr.* = 0;
-    }
-    return image;
-}
-
 fn allocExecutableImage(preferred_base: u64, size: usize) ![*]u8 {
     if (builtin.os.tag == .windows) {
         const MEM_COMMIT: u32 = 0x00001000;
@@ -549,9 +551,9 @@ fn allocExecutableImage(preferred_base: u64, size: usize) ![*]u8 {
         const PAGE_EXECUTE_READWRITE: u32 = 0x40;
         const ptr = c.VirtualAlloc(
             @ptrFromInt(preferred_base),
-                                   size,
-                                   MEM_COMMIT | MEM_RESERVE,
-                                   PAGE_EXECUTE_READWRITE,
+            size,
+            MEM_COMMIT | MEM_RESERVE,
+            PAGE_EXECUTE_READWRITE,
         ) orelse c.VirtualAlloc(
             null,
             size,
@@ -569,11 +571,11 @@ fn allocExecutableImage(preferred_base: u64, size: usize) ![*]u8 {
 
         const ptr = c.mmap(
             @ptrFromInt(preferred_base),
-                           size,
-                           PROT_READ | PROT_WRITE | PROT_EXEC,
-                           MAP_PRIVATE | MAP_ANONYMOUS,
-                           -1,
-                           0,
+            size,
+            PROT_READ | PROT_WRITE | PROT_EXEC,
+            MAP_PRIVATE | MAP_ANONYMOUS,
+            -1,
+            0,
         ) orelse return error.OutOfMemory;
 
         if (@intFromPtr(ptr) == MAP_FAILED) return error.OutOfMemory;
@@ -606,4 +608,3 @@ fn applyRelocations(base: [*]u8, reloc_dir: DataDirectory, delta: i64) void {
         offset += block_size;
     }
 }
-
