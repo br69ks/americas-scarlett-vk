@@ -1,38 +1,24 @@
 # americas-scarlett-loader
 
-Experimental cross-platform (Linux/Windows) x86-64 compatibility loader and Vulkan translation layer for Project Americas (`Scarlett`) binaries.
+Experimental x86-64 compatibility loader for Project Americas (`Scarlett`) on Linux and Windows.
 
-## Quick Start
+**Status:** Linux runs the real guest UCRT/VCRUNTIME/MSVCP through the pre-graphics platform and stops at the first `D3D12XboxCreateDevice` call, 20/20 runs. D3D12 and graphics are not implemented. Windows cross-builds but is not yet validated.
 
-1. **Generate IAT fallback stubs from an import dump:**
-   ```bash
-   python3 tools/gen_stubs.py imports.txt src/shims/generated
-   ```
+## Build and test
 
-2. **Build the loader (Linux native):**
-   ```bash
-   zig build -Doptimize=ReleaseFast
-   ```
+```bash
+zig build -Doptimize=ReleaseFast
+zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
+zig build test
+python3 -m unittest discover -s tools -p 'test_*.py' -v
+```
 
-3. **Cross-compile for Windows from Linux:**
-   ```bash
-   zig build -Dtarget=x86_64-windows -Doptimize=ReleaseFast
-   ```
+## Run
 
-4. **Run against extracted executable:**
-   ```bash
-   ./zig-out/bin/americas-loader /path/to/game_scarlett_master.exe
-   ```
+```bash
+./zig-out/bin/americas-loader --game-dir /path/to/game /path/to/game_scarlett_master.exe
+```
 
-5. **Run tests:**
-   ```bash
-   zig build test
-   python3 -m unittest discover -s tools -p 'test_*.py' -v
-   ```
+Unimplemented imports fail closed. `SCARLETT_STUB_POLICY=zero` is a debug-only escape hatch.
 
-Generated stubs fail closed: an unimplemented API aborts with `[STUB] ...`.
-Set `SCARLETT_STUB_POLICY=zero` to restore the old zero-return behaviour when
-debugging a specific path.
-
-## Project Roadmap
-See [docs/ROADMAP.md](docs/ROADMAP.md) for the milestone checklist and runtime loading pipeline.
+See [docs/ROADMAP.md](docs/ROADMAP.md) for milestone status.
